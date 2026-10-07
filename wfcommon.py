@@ -4,7 +4,8 @@ Imported by wf.py (runner), __init__.py (tool door), dashboard/plugin_api.py (UI
 Everything that decides "is this result still trustworthy" or "what state is this run
 in" lives here, so the three readers can never disagree.
 """
-import hashlib, json, os, re, shlex, subprocess, sys
+import hashlib, json, os, re, shlex, subprocess, sys, time
+from datetime import datetime, timezone
 from collections import namedtuple
 from pathlib import Path
 
@@ -2881,6 +2882,262 @@ def quote_json_parse_error(text, exc):
     return t[max(0, off - 40):off + 40]
 
 # ---------- runner identity and exit record (Lane A writes, this side ONLY reads) ----------
+#
+# #44 (fix/lock-heal-44b) — the lock truth of a run dir is a TRI-STATE read, never
+# a bool. The in-process bool probe is what wedged the fleet: a door SIGKILLed
+# mid-probe can strand the open file description it created, and the flock rides
+# that fd beyond the door's death (observed 2026-09-29: Errno 11 forever, children
+# gone, wait-resume permanently impossible). Three laws, both PR #47 review blocks
+# honored:
+#   B1  EACCES on an EXISTING lock is 'unknown', NEVER free: a permission failure
+#       proves nothing about holders; PR #47 mapped it to missing->dead and let a
+#       wait respawn over a LIVE holder.
+#   B2  probe -> heal is closed against a concurrently-advancing holder: the heal's
+#       FINAL re-verification runs under the admission heal-barrier and reads the
+#       kernel ledger (/proc/locks) — a holder that wakes between check and commit
+#       shows a row and the heal refuses. The check and the commit observe the same
+#       kernel truth with nothing mutable shared between observers (no per-path
+#       side state at all — every observation returns its own verdict+detail).
+#       The wedge is healed by REPLACE (rename the stranded inode aside — never
+#       unlink, evidence kept — and hand out a NEW path/inode), NOT by stealing:
+#       the same inode an invisible orphan still holds stays exactly where it is,
+#       so a live-or-ambiguous holder is never displaced.
+# The probe NEVER takes the flock in-process: a short-lived child opens + flocks +
+# exits; the child's death IS the release, so the door's own fd table never holds
+# the lock across anything (issue ask 1's kill-the-probe-mid-flight contract).
+
+PROC_LOCKS_PATH_ENV = "WF_PROC_LOCKS_PATH"   # test seam; default /proc/locks verbatim
+RUNNER_LEASE = "runner.lease"                # admission identity record (wf.py writes)
+LEASE_STALE_S = 120.0                        # a live runner heartbeats 'at' every loop
+LOCK_PROBE_CHILD = (
+    # opens WITHOUT O_CREAT (read-path no-litter law: a missing file is honest
+    # absence), flocks EX|NB, answers one word on stdout. Its exit releases.
+    "import errno,fcntl,os,sys\n"
+    "try:\n"
+    "    fd=os.open(sys.argv[1],os.O_RDWR)\n"
+    "except FileNotFoundError:\n"
+    "    print('missing'); raise SystemExit(0)\n"
+    "except PermissionError:\n"
+    "    print('eacces'); raise SystemExit(0)\n"
+    "except OSError as e:\n"
+    "    print('errno'+str(e.errno)); raise SystemExit(0)\n"
+    "try:\n"
+    "    try:\n"
+    "        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+    "        print('free')\n"
+    "    except OSError as e:\n"
+    "        print('busy' if e.errno==errno.EAGAIN else 'errno'+str(e.errno))\n"
+    "finally:\n"
+    "    os.close(fd)\n")
+
+def _lock_probe_child(lock_path, timeout=5.0):
+    """One word from a dying process: missing|eacces|free|busy|errno<n>|unknown.
+    'unknown' = the probe itself could not be trusted (fork failure, timeout,
+    garbage) — never evidence of absence, never evidence of presence."""
+    try:
+        p = subprocess.run([sys.executable, "-c", LOCK_PROBE_CHILD, str(lock_path)],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return "unknown"
+    out = (p.stdout or "").strip().splitlines()
+    word = out[-1].strip() if out else ""
+    return word if word in ("missing", "eacces", "free", "busy") or word.startswith("errno") \
+        else "unknown"
+
+_LOCK_PROBE_BATCH_CHILD = (
+    # #44 (PR #47 C2 law): ONE child probes the WHOLE batch — a census of 50 run
+    # dirs costs one spawn, not fifty. A poisoned path (fork-time error on one
+    # entry) answers 'unknown' for that entry and preserves the other answers.
+    "import errno,fcntl,json,os,sys\n"
+    "out={}\n"
+    "for k,p in json.loads(sys.argv[1]).items():\n"
+    "    try:\n"
+    "        fd=os.open(p,os.O_RDWR)\n"
+    "    except FileNotFoundError:\n"
+    "        out[k]='missing'; continue\n"
+    "    except PermissionError:\n"
+    "        out[k]='eacces'; continue\n"
+    "    except OSError as e:\n"
+    "        out[k]='errno'+str(e.errno); continue\n"
+    "    try:\n"
+    "        try:\n"
+    "            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+    "            out[k]='free'\n"
+    "        except OSError as e:\n"
+    "            out[k]='busy' if e.errno==errno.EAGAIN else 'errno'+str(e.errno)\n"
+    "    finally:\n"
+    "        os.close(fd)\n"
+    "print(json.dumps(out))\n")
+
+def _lock_probe_children(lock_paths, timeout=8.0):
+    """Batch child-probe: {path: word}. Any batch failure answers 'unknown' for
+    EVERY entry (fail-closed busy, never free)."""
+    paths = [str(p) for p in lock_paths]
+    if not paths:
+        return {}
+    try:
+        p = subprocess.run([sys.executable, "-c", _LOCK_PROBE_BATCH_CHILD,
+                            json.dumps({str(i): q for i, q in enumerate(paths)})],
+                           capture_output=True, text=True, timeout=timeout)
+        raw = json.loads((p.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return {q: "unknown" for q in paths}
+    return {q: (raw.get(str(i)) or "unknown") for i, q in enumerate(paths)}
+
+def _proc_locks_index():
+    """The kernel ledger in ONE read: {dev:ino-hex: [pid, ...]} for advisory
+    FLOCK rows, or None when the ledger itself is unreadable (honest unknown —
+    callers fail-closed to busy, never free)."""
+    out = {}
+    try:
+        with open(os.environ.get(PROC_LOCKS_PATH_ENV) or "/proc/locks",
+                  errors="replace") as f:
+            for line in f:
+                fields = line.split()
+                #  343: FLOCK  ADVISORY  WRITE  PID DEV:INO 0 EOF
+                if len(fields) >= 6 and fields[1] == "FLOCK":
+                    try:
+                        out.setdefault(fields[5], []).append(int(fields[3]))
+                    except ValueError:
+                        out.setdefault(fields[5], []).append(-1)
+    except OSError:
+        return None
+    return out
+
+def _ledger_pids_for(ledger, path):
+    """PIDs holding an advisory flock on this inode's (dev, ino): [] via a REAL
+    ledger read means VERIFIED zero holders; None means the ledger or the
+    inode identity was unreadable (fail-closed). The kernel's OWN answer to
+    'who holds this flock' — it sees holders our /proc view cannot (sibling
+    pid namespaces)."""
+    if ledger is None:
+        return None
+    try:
+        want = os.stat(path)
+        # kernel format: major:minor are %02x, the inode is DECIMAL
+        # (`00:43:28345670`) — verified against /proc/locks; hex inode never
+        # matches and silently launders every held lock to zero-row.
+        key = "%02x:%02x:%d" % (os.major(want.st_dev), os.minor(want.st_dev),
+                                want.st_ino)
+    except OSError:
+        return None
+    return ledger.get(key, [])
+
+def _lease_state(r):
+    """Read the admission lease: (verdict, detail). A lease is written at
+    admission and HEARTBEATED (field 'at') by the live holder (wf.py
+    acquire_lock/_lease_beat) — two independent proofs, both fail-closed LIVE:
+      live    either (a) pid+boottime verify against /proc right now (identity —
+              boottime mismatch is the anti-pid-reuse proof, so a stale 'at' on
+              a VERIFIED identity is a paused holder, not a corpse), or
+              (b) the heartbeat is fresh (only a living process writes 'at'; a
+              sibling-namespace holder we cannot see still beats — the 91b9a3de
+              fleet shape), or the pid exists but is EPERM (someone else's
+              world — unverified is never proof of death).
+      dead    ONLY when the kernel disproves BOTH proofs at once: the pid is
+              absent (ESRCH) AND the heartbeat is stale (older than
+              LEASE_STALE_S, so it cannot be a beat in flight), or the pid is
+              present with a DIFFERENT boottime (pid reuse — kernel-proven).
+      absent  no lease / unreadable — a legacy dir: honest absence, fail-closed
+              to the 91b9a3de law verbatim (held => live)."""
+    try:
+        rec = jload(Path(r) / RUNNER_LEASE)
+    except Exception:
+        rec = None
+    if not isinstance(rec, dict):
+        return "absent", {}
+    pid, bt, at = rec.get("pid"), rec.get("boottime"), rec.get("at")
+    try:
+        pid = int(pid)
+        bt = int(bt)
+        at = float(at)
+    except (TypeError, ValueError):
+        return "absent", rec
+    fresh = (time.time() - at) <= LEASE_STALE_S
+    perm = False
+    try:
+        os.kill(pid, 0)
+        pid_exists = True
+    except OSError as e:
+        pid_exists = e.errno == 1               # EPERM: exists, not ours to signal
+        perm = e.errno == 1
+    if pid_exists and not perm:
+        try:
+            rest = Path(f"/proc/{pid}/stat").read_text(errors="replace").rsplit(")", 1)[1].split()
+            observed_bt = int(rest[19])
+        except (OSError, IndexError, ValueError):
+            return "live", rec                  # kill-0 passed, row unreadable:
+                                                # cannot disprove identity
+        if observed_bt == bt:
+            return "live", rec                  # identity VERIFIED (outranks a stale beat)
+        return "dead", rec                      # pid reuse: the kernel says so
+    if pid_exists:                              # EPERM — verified to exist
+        return "live", rec
+    # pid NOT visible here: the cross-namespace shape (91b9a3de) OR genuinely
+    # dead. The heartbeat is the tie-breaker only a live process can pull.
+    if fresh:
+        return "live", rec                      # beating right now => alive next door
+    return "dead", rec                          # invisible AND silent: proven dead
+
+def _lease_live(r):
+    return _lease_state(r)[0] == "live"
+
+def _classify_lock_word(word, lock, r, ledger):
+    """Fold one probe word + kernel ledger + lease into (state, detail).
+      free    absent file, or uncontended probe (kernel proved nobody holds it)
+      eacces  the path EXISTS but is unreadable — permission proves NOTHING about
+              holders (B1): never free, never dead, heal must refuse
+      busy    probe says held AND the kernel ledger has a row, or the ledger is
+              unreadable, or a live/fresh lease vouches (cross-ns fleet shape)
+      wedged  probe Errno 11, ZERO ledger rows for the inode, AND the lease is
+              proven dead: no live holder can be found anywhere we can look, yet
+              the inode will not be granted. The #44 field shape.
+    Shared by the single probe and the batch census so BOTH answer from the same
+    evidence with NO mutable per-path side state (the observer-race class)."""
+    if word in ("missing", "free"):
+        return "free", {"probe": word}
+    if word == "eacces":
+        return "eacces", {"probe": word}
+    if word != "busy":
+        # A probe we could not trust (unknown/errno<n>) proves nothing either way
+        # — fail-closed busy, NEVER free (the false-dead class PR #47 shipped).
+        return "busy", {"probe": word}
+    pids = _ledger_pids_for(ledger, lock)
+    if pids is None:
+        return "busy", {"probe": word, "ledger": "unreadable"}
+    lv, lease = _lease_state(r)
+    if pids:
+        return "busy", {"probe": word, "ledger_pids": pids}
+    if lv == "absent":
+        # legacy dir pre-dating the lease: the 91b9a3de law applies verbatim —
+        # held => live. Zero rows across a mount boundary is not proof of absence
+        # (the field shows exactly that). Only the explicit operator verb
+        # (release_lock) carries authority over this shape; wait never heals it.
+        return "busy", {"probe": word, "ledger": "zero", "lease": "absent-legacy"}
+    if lv in ("live", "fresh"):
+        return "busy", {"probe": word, "ledger": "zero", "lease": lv}
+    return "wedged", {"probe": word, "ledger": "zero", "lease": lv,
+                      "holder_pid": lease.get("pid")}
+
+def runner_lock_state(r):
+    """The ONE lock truth of a run dir: (state, detail) — see _classify_lock_word.
+    Deliberately NO O_CREAT anywhere in the probe (read-path no-litter law)."""
+    r = Path(r)
+    lock = r / "runner.lock"
+    word = _lock_probe_child(lock)
+    return _classify_lock_word(word, lock, r, _proc_locks_index())
+
+def runner_lock_states(runs):
+    """Batch census of run dirs: {run: (state, detail)} with ONE probe child and
+    ONE ledger read for the WHOLE batch (the dashboard/act_list read path was
+    spawning one probe per row; #47 round-3 sibling gap, closed here)."""
+    runs = [Path(x) for x in runs]
+    if not runs:
+        return {}
+    words = _lock_probe_children([r / "runner.lock" for r in runs])
+    ledger = _proc_locks_index()
+    return {r: _classify_lock_word(words[str(r / "runner.lock")],
+                                    r / "runner.lock", r, ledger) for r in runs}
 
 def runner_lock_held(r):
     """91b9a3de: cross-container liveness truth. The runner takes an exclusive
@@ -2890,25 +3147,99 @@ def runner_lock_held(r):
     fleet: shared ~/.hermes volume, separate pid namespaces). os.kill(pid, 0)
     CANNOT see those pids: the same pid reads as dead here while it is very much
     alive next door, and a wait-based caller respawns a second runner over live
-    children (the fb-squad false-'interrupted' class). Probe: LOCK_EX|LOCK_NB on
-    the lock file; getting the lock means nobody holds it (the fd closes on return
-    and the kernel releases it). Deliberately NO O_CREAT: a read path (act_list
-    probes every run dir) must never litter empty lock files into historical runs
-    — a missing file is exactly as honest an absence of a holder as an
-    uncontended one. Missing file / unknown errors are honest ABSENCE of a holder
-    (False), never a liveness claim."""
+    children (the fb-squad false-'interrupted' class). #44: the probe is a
+    short-lived CHILD (the child's death is the release — a SIGKILLed door never
+    strands an fd it never opened) and the answer is tri-state; this bool view
+    reads HELD for anything that is not proven free-or-wedged. Missing file is
+    exactly as honest an absence of a holder as an uncontended one. EACCES and
+    probe failure count HELD (fail-closed, B1/B2 law)."""
+    state, _ = runner_lock_state(r)
+    return state not in ("free", "wedged")
+
+def heal_wedged_runner_lock(r, between_check_and_commit=None):
+    """The #44 escape hatch (issue ask 2), safe against BOTH PR #47 blocks.
+
+    Refuses unless the wedge is PROVEN (probe busy + zero kernel ledger rows +
+    lease proven dead); on EACCES/unknown/ledger-unreadable/holder-alive it
+    REFUSES, never heals (B1). The commit happens under the SAME admission
+    heal-barrier wf.py acquire_lock takes before it ever opens the lock path
+    (runner.lock.heal, LOCK_EX|LOCK_NB): a cooperating admission cannot be
+    mid-flock while we commit. Immediately before the rename the state is
+    RE-VERIFIED — fresh probe + fresh ledger scan + fresh lease read — so a
+    holder that wakes between check and commit shows its kernel row or wins the
+    fresh probe and the heal REFUSES (B2; the test injects exactly that
+    interleaving). The stranded inode is RENAMED aside (runner.lock.stranded-*,
+    never unlinked: it belongs to whoever holds it and stays forensically
+    available); a NEW path takes over. A live holder of the OLD inode is never
+    displaced — nothing steals a lock whose holder is alive-or-ambiguous: the
+    replacement hands the lane a fresh inode while the orphan keeps the corpse.
+    Returns {ok, reason} and appends a run.lock_healed event (derive-of-record:
+    the event only rides after the rename actually happened)."""
+    r = Path(r)
+    lock = r / "runner.lock"
+    state, detail = runner_lock_state(r)
+    if state == "free":
+        return {"ok": True, "reason": "free", "detail": detail}   # idempotent no-op
+    if state != "wedged":
+        # 'busy' proves a holder (kernel row) or refuses to disprove one (ledger
+        # unreadable / legacy lease) — either way the refusal names the holder
+        # ground; eacces names the permission ground (B1).
+        _why = "holder-alive" if state == "busy" else f"not-wedged:{state}"
+        return {"ok": False, "reason": _why, "detail": detail}
+    barrier = r / "runner.lock.heal"
     try:
         import fcntl
-        fd = os.open(os.path.join(str(r), "runner.lock"), os.O_RDWR)
+        bfd = os.open(str(barrier), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as e:
+        return {"ok": False, "reason": f"barrier-open-errno{e.errno}", "detail": detail}
+    try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return False
+            fcntl.flock(bfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            return True
-        finally:
-            os.close(fd)
-    except OSError:
-        return False
+            # An admission is IN FLIGHT on this lane. It either wins the lock
+            # (a holder — heal refuses, it won) or dies; re-probing after a
+            # bounded wait lets the ledger, not this function, decide.
+            try:
+                fcntl.flock(bfd, fcntl.LOCK_EX)      # wait: admission is bounded
+            except OSError:
+                return {"ok": False, "reason": "barrier-unlockable", "detail": detail}
+        if between_check_and_commit is not None:
+            between_check_and_commit()               # test seam: the waking holder
+        # --- B2: the SAME kernel truth again, atomically before the commit. ---
+        state2, detail2 = runner_lock_state(r)
+        if state2 != "wedged":
+            return {"ok": False, "reason": f"holder-advanced:{state2}", "detail": detail2}
+        strand = None
+        if lock.exists():
+            strand = r / f"runner.lock.stranded-{int(time.time())}-{os.getpid()}"
+            try:
+                os.rename(str(lock), str(strand))
+            except OSError as e:
+                return {"ok": False, "reason": f"rename-errno{e.errno}", "detail": detail2}
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+            os.close(fd)                             # new path/inode: lockable fresh
+        except OSError as e:
+            if strand is not None:                   # put the corpse back; no-op heal
+                try: os.rename(str(strand), str(lock))
+                except OSError: pass
+            return {"ok": False, "reason": f"recreate-errno{e.errno}", "detail": detail2}
+        try:
+            with open(r / "events.jsonl", "a") as f:
+                f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"), "event": "run.lock_healed",
+                    "stranded": str(strand) if strand else None,
+                    "detail": {k: v for k, v in detail2.items() if k != "probe"}}) + "\n")
+        except OSError:
+            pass                                     # event legibility, never fatal
+        return {"ok": True, "reason": "healed", "stranded": str(strand) if strand else None,
+                "detail": detail2}
+    finally:
+        try:
+            fcntl.flock(bfd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(bfd)
 
 def _runner_pid_alive(r, pid_path=None):
     """A pid is not ownership: verify a live, non-zombie `wf.py run <id>`.
@@ -2969,7 +3300,7 @@ def _runner_pid_alive(r, pid_path=None):
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return False
 
-def runner_alive(r, pid_path=None):
+def runner_alive(r, pid_path=None, lock_state=None):
     """91b9a3de: ONE liveness law, cross-container safe. The runner holds an
     exclusive flock on <run>/runner.lock for its whole life, and flock is
     kernel-enforced across every pid namespace sharing the mount — so the probe
@@ -2980,8 +3311,19 @@ def runner_alive(r, pid_path=None):
     its pid namespace). Otherwise fall back to the ORIGINAL pid-identity law
     verbatim (argv `wf.py run <id>` + effective-root match), so a lock file no
     one holds, or a foreign/crashed pid, behaves exactly as before. The flock
-    half fails CLOSED: a held probe can only ever ADD liveness, never remove it."""
-    if runner_lock_held(r):
+    half fails CLOSED: a held probe can only ever ADD liveness, never remove it.
+
+    #44: the probe is the child-probe TRI-STATE (runner_lock_state), and 'wedged'
+    — Errno 11 with the kernel ledger proving ZERO holders and the admission
+    lease proven dead — is the ONE held-with-no-holder state that does NOT add
+    liveness: nothing can progress on it, and wait's escape hatch (or the
+    explicit release_lock verb) is the recovery. EACCES/unknown stay fail-closed
+    HELD (B1): never free, never dead. lock_state optionally carries an already
+    observed (state, detail) from a batch census (no second probe — A2 one-read
+    law, and the dashboard/act_list one-child-per-batch law)."""
+    if lock_state is None:
+        lock_state = runner_lock_state(r)
+    if lock_state[0] not in ("free", "wedged"):
         return True
     return _runner_pid_alive(r, pid_path)
 
@@ -3845,7 +4187,7 @@ def _wall_meter(n, active, extends):
     return {"elapsed_s": elapsed, "wall_s": wall_s, "p95_s": p95,
             "meter": "over-p95" if over else "near-wall" if near else "on-track"}
 
-def run_state(r):
+def run_state(r, lock_state=None):
     """Derived truth of a run dir: status, per-node status, held gate meta.
     status: pending|running|interrupted|held|done|failed|stopped.
     'interrupted' has unfinished work but NO verified runner; only wait/release/amend
@@ -3856,7 +4198,14 @@ def run_state(r):
     # Exit-agent records are diagnostics, never part of the run's verdict math.
     graph = {**stored_graph, "nodes": workflow_nodes(stored_graph)}
     byid = {n["id"]: n for n in stored_graph["nodes"]}
-    live = runner_alive(r)
+    # #44: ONE lock observation for the whole read — runner_alive consumes the
+    # same (state, detail) the payload publishes as runner_lock (A2 one-read law:
+    # a second probe microseconds later can flip across a dying runner's flock).
+    # A census caller (act_list, dashboard _list_runs) passes the batched probe
+    # result in so the whole listing costs ONE probe child, not one per row
+    # (PR #47 round-3 sibling gap: 50 rows spawned 50 children).
+    _lock_state = lock_state if lock_state is not None else runner_lock_state(r)
+    live = runner_alive(r, lock_state=_lock_state)
     try:
         events_text = (r / "events.jsonl").read_text()
     except (OSError, UnicodeError):
@@ -4000,6 +4349,13 @@ def run_state(r):
             # respawn it then abandoned (the R6 regression shape). Consumers
             # that need liveness use THIS field.
             "runner_live": live,
+            # #44: the ONE lock observation this state was derived from, published
+            # so the door never re-probes (wedged = Errno 11 + kernel ledger proves
+            # zero holders + lease dead — the recoverable wedge; see runner_alive).
+            "runner_lock": _lock_state[0],
+            **({"runner_lock_detail": {k: v for k, v in _lock_state[1].items()
+                                       if k != "probe"}}
+               if _lock_state[0] in ("wedged", "eacces") else {}),
             "runner_exit": exit_state,
             "started": (jload(r / "run.json", {}) or {}).get("started"),
             "owner": (jload(r / "run.json", {}) or {}).get("owner"),

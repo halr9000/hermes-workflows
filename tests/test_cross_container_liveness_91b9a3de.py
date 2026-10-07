@@ -189,13 +189,26 @@ check(alock.count("LOCK_EX | fcntl.LOCK_NB") == 1 and "for _ in range(" in alock
       "admission retry is bounded (a real holder still exits; probes do not)")
 
 # --- (6) MUTATION CONTROL: the law must be the OR, not a stray always-true -------
+# #44 (fix/lock-heal-44b) re-shape: the bool probe became the child-probe TRI-STATE
+# (runner_lock_state); the law being pinned here is UNCHANGED — the kernel flock
+# ORs into the ONE liveness predicate exactly once, the pid law is the verbatim
+# fallback, and every read-path probe never creates the lock file. The pins moved
+# to the new shape; the OLD shape pinned the OLD bytes, which the fix legitimately
+# replaces (child-probe + wedged-state escape hatch); nothing here may become
+# an always-true.
 src = (BUILD / "wfcommon.py").read_text()
-check(src.count("if runner_lock_held(r):\n        return True") == 1,
+check(src.count('if lock_state[0] not in ("free", "wedged"):\n        return True') == 1,
       "flock ORs into the ONE predicate exactly once (no second liveness store)")
 check("def _runner_pid_alive" in src and "return _runner_pid_alive(r, pid_path)" in src,
       "pid-identity law preserved verbatim as the fallback")
-probe_src = src[src.index("def runner_lock_held"):src.index("def _runner_pid_alive")]
+probe_src = src[src.index("LOCK_PROBE_CHILD = ("):src.index("_LOCK_PROBE_BATCH_CHILD = (")]
 check("os.O_CREAT" not in probe_src,
-      "the probe never CREATES a lock file (read paths must not litter run dirs)")
+      "the single probe child never CREATES a lock file (read paths must not litter)")
+batch_src = src[src.index("_LOCK_PROBE_BATCH_CHILD = ("):src.index("def _proc_locks_index")]
+check("os.O_CREAT" not in batch_src,
+      "the batch probe child never CREATES a lock file either")
+rs_src = src[src.index("def runner_lock_state(r):"):src.index("def runner_lock_states")]
+check("os.O_CREAT" not in rs_src,
+      "the single-path census entry never creates (only the heal may)")
 
 print(f"ALL PASS ({ok})")

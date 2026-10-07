@@ -99,7 +99,11 @@ def hold(r, tag):
     p = subprocess.Popen([sys.executable, HOLDER, str(r / "runner.lock"), str(ready)],
                          stdout=subprocess.PIPE, text=True)
     assert p.stdout.readline().strip() == "held", "holder failed to take the flock"
-    return p, int(ready.read_text())
+    for _ in range(200):                      # the ready inode lands right after
+        if ready.exists() and ready.read_text().strip():
+            return p, int(ready.read_text())
+        time.sleep(0.02)
+    raise AssertionError("holder never reported its inode")
 
 def release(p):
     p.send_signal(signal.SIGKILL); p.wait()
@@ -117,8 +121,9 @@ def ledger(zero_rows=True):
     return None
 
 def add_ledger_row(pid, ino, dev):
+    # kernel key format: major:minor hex, INODE DECIMAL (verified against /proc/locks)
     cur = FAKE_LEDGER.read_text()
-    row = f"9: FLOCK  ADVISORY  WRITE {pid} {dev:x}:{ino:x} 0 EOF"
+    row = "9: FLOCK  ADVISORY  WRITE %d %02x:%02x:%d 0 EOF" % (pid, os.major(dev), os.minor(dev), ino)
     FAKE_LEDGER.write_text((cur + "\n" if cur.strip() else "") + row + "\n")
 
 def real_locks_rows(ino):
@@ -126,7 +131,7 @@ def real_locks_rows(ino):
     try:
         for line in Path("/proc/locks").read_text(errors="replace").splitlines():
             f = line.split()
-            if len(f) >= 6 and f[1] == "FLOCK" and f[5].endswith(f":{ino:x}"):
+            if len(f) >= 6 and f[1] == "FLOCK" and f[5].endswith(f":{ino}"):
                 out.append(f)
     except OSError:
         return None
@@ -172,9 +177,9 @@ lock_path = r_e / "runner.lock"
 os.chmod(lock_path, 0o000)
 try:
     st, detail = wfcommon.runner_lock_state(r_e)
-    check("B1a EACCES on existing lock probes 'unknown', never 'free'",
-          st == "unknown", f"state={st} detail={detail}")
-    check("B1b unknown => runner_alive fail-closed (never False over a live holder)",
+    check("B1a EACCES on existing lock is its OWN fail-closed state, never 'free'",
+          st == "eacces", f"state={st} detail={detail}")
+    check("B1b eacces => runner_alive fail-closed True (never False over a live holder)",
           wfcommon.runner_alive(r_e) is True)
     hres = wfcommon.heal_wedged_runner_lock(r_e)
     check("B1c EACCES => heal REFUSES (never heals on permission failure)",
@@ -280,7 +285,10 @@ release(p)
 check("W9 heal is idempotent: a second heal on a free lane returns ok",
       wfcommon.heal_wedged_runner_lock(r_w).get("ok") is True)
 
-# live lease (pid+boottime identity verifies) => never wedged, heal refuses
+# live lease (pid+boottime identity verifies) => never wedged, heal refuses.
+# PRODUCTION ledger (real /proc/locks seam restored): the holder's row is a real
+# kernel fact here; the lease carries the cross-ns holder (row-less) shape.
+ledger(None)
 r_l = mkrun("wedge-lease")
 vp, ino5 = hold(r_l, "lease")
 stat_line = Path(f"/proc/{vp.pid}/stat").read_text(errors="replace")
@@ -331,6 +339,7 @@ def call(**a): return json.loads(door.handle(a))
 
 r_d2 = mkrun("door-wedge")
 p4, ino4 = hold(r_d2, "d")
+ledger(zero_rows=True)                      # orphan stand-in (real EAGAIN)
 (r_d2 / "wf.pid").write_text(str(999997))
 (r_d2 / "runner.lease").write_text(json.dumps(
     {"pid": 999997, "boottime": 1, "at": time.time() - 3600}))
@@ -341,6 +350,7 @@ check("D1 door status on the wedge: runner_live False + wedge surfaced",
 rel = call(action="release_lock", run_id="door-wedge")
 check("D2 door release_lock heals the verified wedge",
       rel.get("ok") is True, json.dumps(rel))
+ledger(None)                                # production ledger back
 rel2 = call(action="release_lock", run_id="door-wedge")
 check("D3 release_lock on a clean lane is honest (ok, nothing to do)",
       rel2.get("ok") is True, json.dumps(rel2))
@@ -350,9 +360,10 @@ check("D4 release_lock refuses an unknown run",
 release(p4)
 
 # ============ CLI: wf.py release-lock (issue ask 2) ================================
-env = {**os.environ, "HERMES_HOME": str(HOME), "WF_RUNS_ROOT": str(RUNS)}
 r_cli = mkrun("cli-wedge")
 p5, ino6 = hold(r_cli, "cli")
+ledger(zero_rows=True)                      # arm the seam BEFORE snapshotting env
+env = {**os.environ, "HERMES_HOME": str(HOME), "WF_RUNS_ROOT": str(RUNS)}
 (r_cli / "runner.lease").write_text(json.dumps(
     {"pid": 999996, "boottime": 1, "at": time.time() - 3600}))
 pr = subprocess.run([sys.executable, str(BUILD / "wf.py"), "release-lock", "cli-wedge"],

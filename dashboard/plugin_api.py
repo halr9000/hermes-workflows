@@ -103,14 +103,20 @@ def _node_log_tail(r, nid, index, attempt, kind, tail):
     return {"id": r.name, "node": name, "kind": kind, "size": size,
             "bytes": len(data), "content": data.decode("utf-8", errors="replace")}
 
-def _view(r, full=False):
-    st = _workflow_common().run_state(r)
+def _view(r, full=False, lock_state=None):
+    st = _workflow_common().run_state(r, lock_state=lock_state)
     if not st:
         return None
     view = {"id": st["run_id"], "name": st["name"], "status": st["status"],
             "started": st.get("started"), "owner": st.get("owner"),
             "nodes_done": st["done"], "nodes_skipped": st["skipped"], "nodes_total": st["total"],
             "updated": (r / "events.jsonl").stat().st_mtime if (r / "events.jsonl").exists() else 0}
+    if st.get("runner_lock") and st["runner_lock"] not in ("busy", "free"):
+        # #44: a wedge (or an EACCES-ambiguous lock) is visible on the card —
+        # honest absence otherwise (golden key sets byte-unchanged for busy/free).
+        view["runner_lock"] = st["runner_lock"]
+        if st.get("runner_lock_detail"):
+            view["runner_lock_detail"] = st["runner_lock_detail"]
     # Agent-first pane (2026-10-03): stamp WHO launched this run. The read model
     # resolves owner.session_id -> profile name via the profiles' own session
     # tables (wfcommon.profiles_by_session, read-only). Absent stays absent —
@@ -211,8 +217,13 @@ def _list_runs():
         roots.append(legacy)
     runs, seen = [], set()
     executed = 0
-    for r in common.iter_run_dirs(roots, reverse=True):
-        v = _view(r)
+    # #44 (PR #47 round-3 sibling gap): 50 rows used to spawn 50 probe children.
+    # ONE batch probe child + ONE ledger read for the whole census now; _view
+    # consumes the pre-observed per-dir lock state (zero extra probes).
+    scanned = list(common.iter_run_dirs(roots, reverse=True))
+    _lock_states = common.runner_lock_states(scanned)
+    for r in scanned:
+        v = _view(r, lock_state=_lock_states.get(r))
         if v and v["id"] not in seen:
             seen.add(v["id"])
             # est-7ps8 (note 2): count EXECUTED only for rows that land in

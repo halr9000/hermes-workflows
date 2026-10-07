@@ -1030,32 +1030,130 @@ def _reacquire_terminal_lock(run):
     return True
 
 
+def _proc_boottime_of(pid):
+    """Kernel boottime (field 22) of a pid — the lease identity that survives pid
+    reuse. Reuses _proc_boottime (defined below the seat law); None on any read
+    failure — the lease then degrades to pid-only, never to a fake number."""
+    try:
+        return _proc_boottime(pid)
+    except Exception:
+        return None
+
+def _lease_heartbeat(run):
+    """#44: the admitted holder re-stamps runner.lease['at'] (atomic replace).
+    A live holder MUST heartbeat; the read model only ever calls a lease DEAD
+    when the stamp is older than LEASE_STALE_S and the pid identity fails — so
+    a cross-mount sibling (whose /proc/locks row may be invisible to us) stays
+    LIVE through its own bytes, exactly as the 91b9a3de law demands."""
+    try:
+        rec = jload(run / wfcommon.RUNNER_LEASE, {}) or {}
+        if rec.get("pid") != os.getpid():
+            return                                   # someone else owns the lease now
+        rec["at"] = time.time()
+        tmp = run / f"{wfcommon.RUNNER_LEASE}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, run / wfcommon.RUNNER_LEASE)  # atomic publish
+    except OSError:
+        pass                                          # legibility, never fatal
+
+def _write_lease(run):
+    """Admission-side lease stamp: pid + kernel boottime + heartbeat clock."""
+    try:
+        rec = {"pid": os.getpid(), "boottime": _proc_boottime_of(os.getpid()),
+               "at": time.time()}
+        tmp = run / f"{wfcommon.RUNNER_LEASE}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, run / wfcommon.RUNNER_LEASE)  # atomic publish
+    except OSError:
+        pass
+
 def acquire_lock(run):
     """Single-runner admission. An advisory flock held for the process lifetime IS
     the ownership proof: the kernel drops it on ANY exit (clean, SIGKILL, crash),
     so there is no stale-file window, no read-empty-pid-then-unlink race, no
-    retry fall-through without proof. Lockfile content is informational only."""
+    retry fall-through without proof. Lockfile content is informational only.
+
+    #44 — admission vs an operator heal, closed WITHOUT taxing the A1 µs budget:
+      * The heal-barrier (runner.lock.heal) is honored when it EXISTS (a heal in
+        progress serializes us out) but never CREATED here — creating a new inode
+        costs ~10ms on the overlayfs and would push admission past the transient
+        probe window the A1 bounded-retry pins (measured: 10.7ms barrier-open ate
+        the 12ms window; only the first create pays, existing opens are ~0.2ms).
+      * The stranded-replace race (a heal renames the path between our open and
+        our flock) closes ATOMICALLY instead of by pre-locking: after winning the
+        flock we compare os.fstat(fd) against os.stat(lock path) — a rename under
+        us shows a different inode at the path, the flock we hold is on the
+        stranded corpse, and we release and RETRY the whole admission (bounded
+        3 rounds). A holder is never displaced: the orphan keeps the old inode,
+        the fresh path is lockable — the field itself proves a new file locks.
+      * Lease: the winner stamps pid + kernel boottime + heartbeat; a heartbeat
+        thread keeps 'at' fresh while the process lives. The read model calls a
+        lease dead ONLY when both proofs fail (pid invisible AND heartbeat stale,
+        or boottime mismatch = kernel-proven pid reuse)."""
     global _LOCK_FD
     lk = run / "runner.lock"
-    fd = os.open(lk, os.O_CREAT | os.O_RDWR, 0o644)
-    # A1 (91b9a3de review, 09-29): the read-only liveness probe fleet-wide takes
-    # LOCK_EX for ~8µs and releases; an admission landing inside that window is
-    # microsecond collision with a PROBE, not contention with a real runner.
-    # Bounded LOCK_NB retry (3 × 10ms) before declaring WORKFLOW_BUSY — a genuine
-    # holder never releases, so the honest exit still comes after ~30ms.
-    for _ in range(3):
+    for _stranded_retry in range(3):
+        # #44 barrier (honor-if-present, never create — see docstring). EACCES or
+        # any failure of the barrier itself is fail-OPEN: admission proceeds
+        # exactly as the base law (a weird barrier file must not lose a lane it
+        # used to win; the atomic same-inode check below is the safety net).
+        barrier_fd = None
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
+            barrier_fd = os.open(str(run / "runner.lock.heal"), os.O_RDWR)
+            fcntl.flock(barrier_fd, fcntl.LOCK_EX)
         except OSError:
-            time.sleep(0.01)
-    else:
-        os.close(fd)
-        emit(f"WORKFLOW_BUSY {run.name} (another runner holds the flock)")
-        sys.exit(0)
-    os.ftruncate(fd, 0)
-    os.write(fd, str(os.getpid()).encode())
-    _LOCK_FD = fd  # never closed; exit releases
+            if barrier_fd is not None:
+                try: os.close(barrier_fd)
+                except OSError: pass
+                barrier_fd = None
+        try:
+            fd = os.open(lk, os.O_CREAT | os.O_RDWR, 0o644)
+            # A1 (91b9a3de review, 09-29): the read-only liveness probe fleet-wide
+            # takes LOCK_EX for ~8µs and releases; an admission landing inside that
+            # window is microsecond collision with a PROBE, not contention with a
+            # real runner. Bounded LOCK_NB retry (3 × 10ms) before declaring
+            # WORKFLOW_BUSY — a genuine holder never releases, so the honest exit
+            # still comes after ~30ms.
+            for _ in range(3):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            else:
+                os.close(fd)
+                emit(f"WORKFLOW_BUSY {run.name} (another runner holds the flock)")
+                sys.exit(0)
+            # #44 B2 atomic re-verification under our OWN fd: the flock above is
+            # only ownership of the inode it names. If the path now resolves to a
+            # different inode, a heal replaced the lane between our open and our
+            # win — our fd is a corpse. Release, re-loop; bounded 3 rounds, then
+            # the honest exit (a churn-loop is a bug elsewhere, not a lock win).
+            try:
+                path_ino = os.stat(lk)
+                ours = os.fstat(fd)
+                same = (path_ino.st_dev, path_ino.st_ino) == (ours.st_dev, ours.st_ino)
+            except OSError:
+                same = False
+            if same:
+                os.ftruncate(fd, 0)
+                os.write(fd, str(os.getpid()).encode())
+                _LOCK_FD = fd  # never closed; exit releases
+                _write_lease(run)   # #44: identity the read model can verify
+                return
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+        finally:
+            if barrier_fd is not None:
+                try: fcntl.flock(barrier_fd, fcntl.LOCK_UN)
+                except OSError: pass
+                try: os.close(barrier_fd)
+                except OSError: pass
+    emit(f"WORKFLOW_BUSY {run.name} (lock path churning under admission)")
+    sys.exit(0)
 
 _READY_FD_ENV = "HERMES_WF_READY_FD"  # #8: inheritable announce pipe fd, door -> runner
 
@@ -7342,6 +7440,17 @@ def main(run_id):
             time.sleep(2)
 
     threading.Thread(target=_stop_watcher, daemon=True).start()
+    # #44 lease heartbeat: while THIS process lives, the lease's 'at' stays fresh
+    # (one beat / 30s << LEASE_STALE_S 120s). The beat dies with the process — a
+    # dead holder CANNOT keep its lease fresh (the kernel dropped its flock at
+    # death; the beat stops too), which is what makes the wedged classification
+    # provable. Daemon thread: never keeps the runner alive on its own.
+    def _lease_beat():
+        while True:
+            try: _lease_heartbeat(run)
+            except Exception: pass
+            time.sleep(30.0)
+    threading.Thread(target=_lease_beat, daemon=True).start()
     first = not (run / "events.jsonl").exists()
     # #8 item 3: crash-respawn idempotence — when a prior runner of this run
     # already logged (events.jsonl exists — the reaper's revival), write the
@@ -7882,8 +7991,28 @@ if __name__ == "__main__":
         register_job(r, n, byid, int(sys.argv[4]), sys.argv[5], sys.argv[6])
         print("WORKFLOW_JOB_REGISTERED " + n["id"])
         sys.exit(0)
+    # #44 (issue ask 2): the owner escape hatch rides the SAME entry point —
+    # `wf.py release-lock <run_id>` heals a PROVEN-wedged runner.lock (zero live
+    # holders on the kernel ledger + dead lease) so wait-resume recovers without
+    # copying directories. Refuses everything else (live holder, EACCES-ambiguous,
+    # legacy lease-absent shape): wfcommon.heal_wedged_runner_lock is the single
+    # safety authority; this door only renders its verdict.
+    if len(sys.argv) == 3 and sys.argv[1] == "release-lock":
+        _rl_run = wfcommon.find_run(sys.argv[2])
+        if not jload(_rl_run / "graph.json", {}):
+            print(f"REFUSED {sys.argv[2]} (unknown run — no graph.json)")
+            sys.exit(1)
+        _rl = wfcommon.heal_wedged_runner_lock(_rl_run)
+        if _rl.get("ok"):
+            print(("RELEASED " if _rl.get("reason") == "healed" else "FREE ")
+                  + f"{_rl_run.name} ({_rl.get('reason')}"
+                  + (f", stranded={Path(_rl['stranded']).name}" if _rl.get("stranded") else "")
+                  + ")")
+            sys.exit(0)
+        print(f"REFUSED {_rl_run.name} ({_rl.get('reason')})")
+        sys.exit(1)
     if len(sys.argv) < 3 or sys.argv[1] != "run":
-        print("usage: wf.py run <run_id>"); sys.exit(2)
+        print("usage: wf.py run <run_id> | wf.py release-lock <run_id>"); sys.exit(2)
     # 5c37b19 guard 2 (belt-and-braces): a runner whose cwd was deleted mid-life dies
     # on the FIRST relative-path/cwd-touching call. HERE is durable — the same dir
     # __init__.py pins as the spawn cwd — so recover there before main() can raise.

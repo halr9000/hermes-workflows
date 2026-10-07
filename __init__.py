@@ -704,8 +704,8 @@ WORKFLOW_PARAMS = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["run", "status", "wait", "release", "steer", "inbox", "amend", "diff", "stop", "list", "save", "submit", "library", "doctor_version", "validate"],
-            "description": "run=launch a graph; wait=read state, RESPAWNING an idle runner if work is pending (blocks to the next boundary when one is live); status=read-model of a run; release=answer a held human gate; steer=queue steering text for a node; inbox=(child-side, cooperative) pull late steering lines baked for THIS spawn — call once at a natural seam; amend=replace the graph (invalidates changed nodes + all downstream by fingerprint), or pass patch to edit a few node fields without resubmitting the whole graph; diff=confirm surface: runs the amend door with dry_run FORCED (accepts patch or graph), returns the preview + graph_diff and touches nothing; stop=request stop; list=all runs; save=shelve a graph in the library under a name (from run_id or inline graph); library=list shelved graphs richly (name, description, tags, provenance, path-relative id). validate=dry-run the door's validation pipeline (defaults fill + defect collection + model/route policy) with no ping and no writes; returns {ok, errors:[{node,field,msg}], resolved_routes}. run from=<name> replays a shelved graph. submit=quarantine a hand-rolled graph for study (requires why_not_library >=80 chars; never joins the library — the quartermaster's human-gated loop decides); inbox kind=submissions lists them newest-first. doctor_version=read-only version truth for THIS install: {live_version, newest_packaged, source_commit, drift} comparing plugin.yaml against the install.json provenance that pack.py stamps at build time \u2014 one read, no network.",
+            "enum": ["run", "status", "wait", "release", "release_lock", "steer", "inbox", "amend", "diff", "stop", "list", "save", "submit", "library", "doctor_version", "validate"],
+            "description": "run=launch a graph; wait=read state, RESPAWNING an idle runner if work is pending (blocks to the next boundary when one is live; when the lock is PROVEN wedged — Errno 11 with the kernel ledger showing zero holders and the admission lease dead — wait heals it first, the #44 escape hatch); status=read-model of a run; release=answer a held human gate; release_lock=operator hatch for a wedged runner.lock (#44): renames the stranded inode aside under the admission heal-barrier and hands the lane a fresh lock path — REFUSES unless zero live holders are proven (never heals on EACCES or a live holder); steer=queue steering text for a node; inbox=(child-side, cooperative) pull late steering lines baked for THIS spawn — call once at a natural seam; amend=replace the graph (invalidates changed nodes + all downstream by fingerprint), or pass patch to edit a few node fields without resubmitting the whole graph; diff=confirm surface: runs the amend door with dry_run FORCED (accepts patch or graph), returns the preview + graph_diff and touches nothing; stop=request stop; list=all runs; save=shelve a graph in the library under a name (from run_id or inline graph); library=list shelved graphs richly (name, description, tags, provenance, path-relative id). validate=dry-run the door's validation pipeline (defaults fill + defect collection + model/route policy) with no ping and no writes; returns {ok, errors:[{node,field,msg}], resolved_routes}. run from=<name> replays a shelved graph. submit=quarantine a hand-rolled graph for study (requires why_not_library >=80 chars; never joins the library — the quartermaster's human-gated loop decides); inbox kind=submissions lists them newest-first. doctor_version=read-only version truth for THIS install: {live_version, newest_packaged, source_commit, drift} comparing plugin.yaml against the install.json provenance that pack.py stamps at build time \u2014 one read, no network.",
         },
         "run_id": {"type": "string", "description": "Run id (required for every action except run/list)."},
         "name": {"type": "string", "description": "run: overrides graph.name (default workflow); save: library name overrides graph.name (lowercase, [-_.]); library: return one entry with refs-derived required params and an instantiate command. amend: set graph.name in the replacement graph; omitting it retains the run name."},
@@ -3201,6 +3201,12 @@ def act_status(args):
            # #19: the graph head rides EVERY status read (derived, never stored —
            # status is where a CAS caller reads the token before a guarded write).
            "graph_revision": _graph_revision(r)}
+    if st.get("runner_lock") and st["runner_lock"] not in ("busy", "free"):
+        # #44: legibility of the recoverable wedge / EACCES-ambiguous lock —
+        # honest absence for the two ordinary states (golden key sets unchanged).
+        out["runner_lock"] = st["runner_lock"]
+        if st.get("runner_lock_detail"):
+            out["runner_lock_detail"] = st["runner_lock_detail"]
     if resolved_via:   # #58: the run lives outside the caller's resolved root — loud, not silent
         out["resolved_via"] = resolved_via
         out["resolved_via_note"] = ("run resolved under a sibling root (dispatch-time home "
@@ -3447,6 +3453,21 @@ def act_wait(args):
     top_alive = None
     if st["status"] in ("running", "pending", "interrupted"):
         top_alive = bool(st.get("runner_live"))   # A2 one-read law: THE ONE read
+        if not top_alive and st.get("runner_lock") == "wedged":
+            # #44 escape hatch (automatic half): the lock says HELD while the
+            # kernel ledger proves ZERO holders and the admission lease is proven
+            # dead — nothing can ever progress on that shape, so wait heals it
+            # BEFORE the respawn below. The heal is the single safety authority
+            # (wfcommon.heal_wedged_runner_lock): it REFUSES on EACCES (B1), on
+            # any live holder, and on the lease-absent legacy shape (that one
+            # only the explicit operator verb carries authority over). A refused
+            # heal falls through to the honest status answer — never a false
+            # respawn over a live holder (the flock admission still makes even a
+            # raced spawn a harmless WORKFLOW_BUSY loser).
+            _wedge_heal = _common.heal_wedged_runner_lock(r)
+            if _wedge_heal.get("reason") == "healed":
+                st = run_state(r)
+                top_alive = bool(st.get("runner_live"))
         if not top_alive:
             _respawn_runner(r)  # only this explicit wait resumes unfinished work
     cap = min(float(args.get("timeout", 600)), 1800)
@@ -3632,6 +3653,35 @@ def act_release(args):
     else:
         hint = "answer recorded; the live runner commits it at its boundary and the next transition wakes the owner automatically"
     return {**res, "hint": hint}
+
+def act_release_lock(args):
+    """#44 (issue ask 2): the operator escape hatch for a wedged runner.lock.
+    The field shape: Errno 11 forever with the kernel ledger proving zero
+    holders and the admission lease dead — wait-resume impossible without
+    copying directories. Delegates to the SINGLE safety authority
+    (wfcommon.heal_wedged_runner_lock): refuses unless the wedge is proven;
+    never heals on EACCES (B1) or against a live/advancing holder (B2 — the
+    final re-verification under the admission heal-barrier); renames the
+    stranded inode aside (evidence kept), never unlinks. Read-only verbs
+    (status/list) NEVER heal; only this verb and wait's wedged-gate do."""
+    r, st, resolved_via = _resolve_read_run(args.get("run_id"))
+    if not st:
+        return {"error": "unknown run_id"}
+    if resolved_via:   # #58 same law as wait: write verbs never cross roots
+        return {"ok": False, "error": "run lives under a sibling root — release_lock "
+                "must be issued from the owning home"}
+    res = _common.heal_wedged_runner_lock(r)
+    out = {**res, "run_id": st["run_id"]}
+    if res.get("ok"):
+        out["hint"] = ("lane re-locked fresh; `wait` resumes unfinished work"
+                       if res.get("reason") == "healed"
+                       else "no wedge present; nothing to do")
+    else:
+        out["hint"] = ("refused: the holder is not proven dead (live ledger row, "
+                       "EACCES-ambiguous, or legacy lease-absent shape). A LEGACY "
+                       "pre-lease dir needs the owner's explicit force — see "
+                       "references/operations.md; do NOT retry-loop this verb.")
+    return out
 
 def act_steer(args):
     r = run_dir(args.get("run_id"))
@@ -3958,8 +4008,12 @@ def act_list(_args):
     # unique by RUN-DIR NAME across every scanned root (symlinked/profile
     # roots multiply hits), never raw per-root iterdir.
     scanned = _common.iter_run_dirs(roots, reverse=True)
+    # #44 (PR #47 C2 law, applied to the door census too): ONE batch probe child
+    # for the whole listing — run_state consumes the pre-observed lock state
+    # instead of spawning one probe child per row.
+    _lock_states = _common.runner_lock_states(scanned)
     for r in scanned:
-        st = run_state(r)
+        st = run_state(r, lock_state=_lock_states.get(r))
         if st and st["run_id"] not in seen:
             seen.add(st["run_id"])
             row = {"run_id": st["run_id"], "name": st["name"], "status": st["status"],
@@ -4020,6 +4074,7 @@ def act_doctor_version(args):
 
 
 ACTIONS = {"run": act_run, "status": act_status, "wait": act_wait, "release": act_release,
+           "release_lock": act_release_lock,
            "steer": act_steer, "inbox": act_inbox, "amend": act_amend, "diff": act_diff, "stop": act_stop, "list": act_list,
            "save": act_save, "submit": act_submit, "library": act_library,
            "doctor_version": act_doctor_version, "validate": act_validate}
