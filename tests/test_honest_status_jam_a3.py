@@ -116,7 +116,9 @@ try:
     # Forge liveness: monkeypatch runner_alive to a stale-pid-alive misread.
     real_alive = wfcommon.runner_alive
     try:
-        wfcommon.runner_alive = lambda r, pid_path=None: True
+        # (#44 keeps the forge honest: run_state threads a lock_state kwarg in —
+        # the forged predicate ignores it, exactly as it ignored pid_path.)
+        wfcommon.runner_alive = lambda r, pid_path=None, lock_state=None: True
         rsB = wfcommon.run_state(rA)
         check(rsB["status"] == "done",
               "rule 2: exit-record 'done' beats a stale-pid live guess", json.dumps(rsB)[:200])
