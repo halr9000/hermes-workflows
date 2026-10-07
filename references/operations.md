@@ -70,6 +70,32 @@ A read-only pass over the tool's defaults — what a first-time agent would wish
 - **`submit` dedupe — default: on, by graph digest + submitted_by, and it is a HINT (`{deduped, existing}`), not a bounce.** A first-time user wishes a resubmit silently overwrote the first copy. Current is right: the inbox is evidence for a human loop, so the tool never mutates or replaces stored receipts; a restatement reports the existing id and the human dedupes with the digest in hand.
 - **`library` unknown shapes — default: skipped + LISTED in `skipped`, never a crash.** A first-time user wishes a corrupt file were auto-repaired or hidden. Current is right: repairing another profile's file is not the library reader's authority (same-UID trust boundary), and hiding it would make a broken entry un-findable; the listed warning is the repairable truth.
 
+## Wedged runner.lock and the `release_lock` escape hatch (#44)
+
+The field shape (2026-09-29): the runner and its children are gone, yet a fresh
+`LOCK_EX|LOCK_NB` on `<run>/runner.lock` returns Errno 11 forever while a new file in
+the same dir locks fine — the holder is a kernel-side orphan / inherited-fd survivor
+beyond our `/proc` view. Left alone, `wait`-resume is permanently impossible.
+
+Three laws keep recovery safe (`wfcommon.py`, pinned by `tests/test_lock_wedge_44b.py`):
+- **Child-probe**: every read-path flock probe runs in a short-lived child whose death
+  IS the release; the door never opens `runner.lock`, so a SIGKILLed door cannot strand
+  an fd it never opened. The probe never creates the lock file.
+- **Tri-state read**: the lock truth of a run dir is `free | busy | eacces | wedged`,
+  never a bool. EACCES on an existing lock is its OWN fail-closed state (never free —
+  a permission failure proves nothing about holders); `busy` is resolved against the
+  kernel ledger (`/proc/locks`, seam `WF_PROC_LOCKS_PATH`) and the admission lease
+  (`runner.lease {pid,boottime,at}`, heartbeated by the live holder). `wedged` requires
+  probe EAGAIN AND zero ledger rows for the inode AND a proven-dead lease.
+- **Safe heal**: `release_lock` (door verb) / `wf.py release-lock <run_id>` renames the
+  stranded inode aside (never unlinks — evidence kept) and hands the lane a fresh lock
+  path, ONLY under the admission heal-barrier (`runner.lock.heal`), and re-verifies
+  probe + ledger + lease immediately before the rename: a holder that wakes between
+  check and commit shows its row and the heal refuses — the holder wins. Read verbs
+  (`status`/`list`) never heal; `wait` heals only the automatic `wedged` shape; a
+  legacy lease-absent dir refuses automatic healing and needs the explicit operator
+  verb. A heal never steals from a live holder and never heals on EACCES.
+
 ## Library provenance
 
 `save` accepts an optional `source` (≤200 chars). When supplied — or when the save happens under a named profile — the library entry records `{owner, source, saved_at, source_digest}`; a default-profile save without `source` writes exactly the pre-1.1 bytes, and legacy entries list as always. `library` shows the fields only when present; `run from:<name>` copies the stamp into run.json as `graph_source`. Provenance is attribution, never permission: no veto, no ACL, no migration of old entries.

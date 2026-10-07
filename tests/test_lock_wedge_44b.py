@@ -242,6 +242,7 @@ p2, ino2 = hold(r_leg, "leg")
 st, _d = wfcommon.runner_lock_state(r_leg)
 check("W3b zero rows + NO lease (legacy) => busy, runner_alive True (fail-closed)",
       st == "busy" and wfcommon.runner_alive(r_leg) is True, st)
+release(p2)                                 # no stray holders leave this file
 
 # ============ B2: holder that re-appears between check and commit WINS ============
 r_b2 = mkrun("b2-race")

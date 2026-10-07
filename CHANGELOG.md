@@ -214,6 +214,36 @@ Earlier merges since the tag, in brief:
 - 9fc82fe #266 — docs(test): trim routing narration from measured-zero docstring, fix provenance (est-2ek.1.797)
 - f0e6935 #269 — fix(runner): gate.held wake is relay-only — agent relays the human gate, never answers it (upstream 133387 ask 2)
 
+Fixes:
+- fix(runner,door): #44 — the stranded `runner.lock` wedge (Errno 11 forever with the
+  kernel ledger knowing zero holders) no longer makes `wait`-resume permanently
+  impossible. The door's liveness read is now a TRI-STATE CHILD-PROBE
+  (`runner_lock_state` → `free|busy|eacces|wedged`): every flock probe runs in a
+  short-lived child whose death is the release (the door never opens `runner.lock`,
+  so a SIGKILLed prober can never strand the fd — issue ask 1); `busy` is resolved
+  against `/proc/locks` (seam `WF_PROC_LOCKS_PATH`) and the new heartbeated admission
+  lease (`runner.lease {pid,boottime,at}`, written/beat by `wf.py acquire_lock`);
+  EACCES on an existing lock is its own fail-closed state, NEVER free (PR #47 block
+  B1); a lease-less legacy dir stays fail-closed busy (91b9a3de law verbatim).
+  `wedged` = probe EAGAIN + zero ledger rows + proven-dead lease — the exact field
+  shape — and is the ONLY shape `wait` auto-heals. The heal
+  (`wfcommon.heal_wedged_runner_lock`, single safety authority) renames the stranded
+  inode aside under the admission heal-barrier (`runner.lock.heal`, which
+  `acquire_lock` honors before opening the path) and RE-VERIFIES probe+ledger+lease
+  immediately before the rename, so a holder that wakes between check and commit
+  wins (PR #47 block B2); the stranded-replace race closes atomically at admission
+  via an fstat-vs-path inode compare with bounded retry, never by displacing a
+  holder. New escape hatch (issue ask 2): door action `release_lock` +
+  `wf.py release-lock <run_id>` — refuses unless zero live holders are proven.
+  `list`/dashboard census batch the probe into ONE child per call (PR #47 C2 law).
+  Read-model surfaces `runner_lock`/`runner_lock_detail` only on non-ordinary states
+  (golden key sets byte-unchanged for busy/free).
+  Test: `tests/test_lock_wedge_44b.py` (35 contracts: child-probe + kill-the-probe
+  mid-flight, B1 EACCES-never-free + heal-refuses, B2 waking-holder-wins, wedge
+  classification + heal re-acquire + idempotence, door + CLI verbs);
+  `tests/test_cross_container_liveness_91b9a3de.py` re-pinned to the tri-state shape
+  (19 contracts, cross-container law byte-preserved).
+
 Discipline / docs:
 - docs: #134 partial-rescue law (jam-g1, epic #40) — AGENTS.md 3d states the
   recovery discipline explicitly: the committed `nodes/*.json` done-set parsed

@@ -68,15 +68,18 @@ def make_tree(tmp: Path, readme_mut=None) -> Path:
     return tree
 
 
-# The fixture's own doc-only tagged row: `release_lock` is NOT dispatched by the
-# door, so this is the sanctioned (open PR #NN) shape. The scenarios below that
-# need a tag to audit inject THIS instead of borrowing whatever the live docs
-# happen to carry — a released tag ages to nothing and would go the suite blind
-# (observed at c09c2fc: after the #47 ageing, B1 saw exit 0 instead of the
-# no-gh exit 2 and C0 crashed on an empty tag set).
-DOC_ONLY_TAG_ROW = ("| `release_lock` | *(open PR #47)* Release a wedged `runner.lock` after "
-                    "proving the holder dead. Refuses contested, gate-held, or alive cases; "
-                    "never unlinks a lock. |")
+# The fixture's own doc-only tagged row: a HYPOTHETICAL action that the door does
+# not and must never dispatch, so this is the sanctioned (open PR #NN) shape.
+# (Was `release_lock` until fix/lock-heal-44b SHIPPED that action — a shipped row
+# tagged as unshipped is exactly the A1 class the audit fails on, so the fixture
+# moved to a permanently-undispatched placeholder. The scenarios below inject THIS
+# instead of borrowing whatever the live docs happen to carry — a released tag
+# ages to nothing and would go the suite blind (observed at c09c2fc: after the #47
+# ageing, B1 saw exit 0 instead of the no-gh exit 2 and C0 crashed on an empty tag
+# set).)
+DOC_ONLY_TAG_ROW = ("| `someday_hypothetical_action` | *(open PR #47)* A deliberately hypothetical "
+                    "action that ACTIONS must never dispatch — the sanctioned doc-only tag shape "
+                    "this fixture injects. |")
 
 
 def add_doc_only_tag(text: str) -> str:
