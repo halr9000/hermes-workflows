@@ -162,6 +162,17 @@ class TeamIntegration(unittest.TestCase):
                         with patch.dict(os.environ, env, clear=True):
                             self.assertTrue(door.act_status({'run_id': r.name})['runner_live'])
                         if mode == 'pid-reused':
+                            # #271 review: the kernel is the lock truth — while a
+                            # LIVE holder holds the flock, held=>live is correct
+                            # (91b9a3de), so "reused pid must not read alive" can
+                            # only be asserted over a DEAD holder. The base code
+                            # passed this branch only because its µs in-process
+                            # probe beat the runner to admission; the #44 child
+                            # probe (spawn cost) exposes that race every run.
+                            # Kill + reap FIRST: the kernel released the flock
+                            # with the process, so the remaining claim under test
+                            # is purely pid-reuse identity.
+                            p.kill(); p.wait()
                             (r / 'wf.pid').write_text(str(os.getpid()))
                             self.assertFalse(common.runner_alive(r))
                             with patch.dict(os.environ, env, clear=True):
