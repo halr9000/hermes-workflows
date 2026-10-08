@@ -608,6 +608,11 @@
     "log": "/home/runner/work/hermes-workflows/hermes-workflows/ci-out/test_live_truth_ui.mjs.log"
   },
   {
+    "test": "test_lock_wedge_44b.py",
+    "exit": 0,
+    "log": "/home/runner/work/hermes-workflows/hermes-workflows/ci-out/test_lock_wedge_44b.py.log"
+  },
+  {
     "test": "test_lost_handoff_sync_wake_r18.py",
     "exit": 0,
     "log": "/home/runner/work/hermes-workflows/hermes-workflows/ci-out/test_lost_handoff_sync_wake_r18.py.log"

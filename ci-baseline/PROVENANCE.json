@@ -329,11 +329,17 @@
       "exit": 0,
       "measured": "2026-10-08 local foreground run on fix/zombie-reaper-continuous (#283, rebased on 0d91f80); re-verified at rebase onto ba81b70 on 2026-10-14: T1-T6 pass, rc=0; added by #283",
       "supersede_by": "next green-CI refresh (replace with the CI-captured row)"
+    },
+    {
+      "test": "test_lock_wedge_44b.py",
+      "exit": 0,
+      "measured": "2026-10-08 local foreground run on the #271 head rebased onto main aca313d: 35 PASS, 0 FAIL, rc=0; fills the ledger gap this #44 test would leave on main (same shape as #285)",
+      "supersede_by": "next green-CI refresh (replace with the CI-captured row)"
     }
   ],
   "source_issue": 75,
   "totals": {
-    "cases": 280,
+    "cases": 281,
     "red": 0
   },
   "tracking_item": "est-9yl2"
