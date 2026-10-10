@@ -2865,6 +2865,26 @@ def _seat_holder_live(pid, bt):
     live = _proc_boottime(pid)
     return live is None or live == bt
 
+# est-2ek.1.857 B1/B2: a prune decision must survive reconfirmation, and every
+# external unlink is attributable. _SEAT_PRUNE_RECONFIRM_S is the settle window
+# between the first all-holders-dead verdict and the reconfirmation scan under
+# the SAME law; the ledger records one JSONL row per pruned ticket.
+_SEAT_PRUNE_RECONFIRM_S = 0.2
+
+def _seat_prune_ledger(seats, ticket, row, reason):
+    """Append one prune row to <seats>/.pruned.jsonl (ts, pruner pid, reason,
+    ticket name + row snapshot). Best-effort: a ledger failure never blocks the
+    prune path, and the ledger is a dot-file so seats.glob("*.json") never
+    mistakes it for a ticket."""
+    try:
+        rec = {"ts": round(time.time(), 3), "pruner_pid": os.getpid(),
+               "reason": reason, "ticket": ticket.name,
+               "row": row if isinstance(row, dict) else None}
+        with open(str(seats / ".pruned.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
 def _seat_live_tickets(seats, anc=()):
     """Held tickets, pruning verifiably dead ones. A ticket held by an ANCESTOR
     of this process (a nested runner launched from inside a seat) is lent, not
@@ -2894,6 +2914,22 @@ def _seat_live_tickets(seats, anc=()):
             live += 1  # unreadable: uncertain capacity, kept and counted
             continue
         if not any(_seat_holder_live(p, b) for p, b in holders):
+            # est-2ek.1.857 B1: a SINGLE unconfirmed death verdict is never
+            # load-bearing. One transiently-wrong sample (an ESRCH/Z-state read
+            # that does not repeat, a momentary /proc fault) used to delete
+            # capacity that was in use — the 12:45Z field shape. Settle, then
+            # RECONFIRM every holder under the SAME law; any holder that
+            # reconfirms alive keeps its ticket AND counts as live (unknown is
+            # never undercounted). Only a death that survives the reconfirmation
+            # window unlinks.
+            time.sleep(_SEAT_PRUNE_RECONFIRM_S)
+            if any(_seat_holder_live(p, b) for p, b in holders):
+                live += 1
+                continue
+            # est-2ek.1.857 B2: an external unlink is never silent — one ledger
+            # row per prune (ts, pruner pid, reason, ticket row snapshot), so a
+            # future ticket-drop is attributable instead of invisible.
+            _seat_prune_ledger(seats, t, row, "holders-dead-reconfirmed")
             try: t.unlink()
             except OSError: pass
             continue
