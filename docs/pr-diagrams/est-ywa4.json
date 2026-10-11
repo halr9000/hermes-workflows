@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "External publication receipt barrier",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "output": "work/est-ywa4.html",
+    "repository": {"url": "https://github.com/jacobhausler/hermes-workflows", "revision": "2e1f2fda2d772a6ea42fe02a24e479e9a371fe90", "provider": "github"}
+  },
+  "lanes": [
+    {"id": "commit", "label": "Committed artifact and evidence"},
+    {"id": "runner", "label": "Runner completion barrier"},
+    {"id": "recovery", "label": "Publication-only recovery", "variant": "exception"}
+  ],
+  "mainPath": ["bank", "receipt", "barrier", "done"],
+  "nodes": [
+    {"id": "bank", "lane": "commit", "col": 0, "type": "database", "label": "Bank artifact", "sublabel": "done or partial record", "width": 162, "sources": [{"path": "wf.py", "line": 1083, "end_line": 1092}]},
+    {"id": "receipt", "lane": "commit", "col": 1, "type": "backend", "label": "Check receipt", "sublabel": "target / expected / actual", "width": 162, "sources": [{"path": "wfcommon.py", "line": 767, "end_line": 800}]},
+    {"id": "barrier", "lane": "runner", "col": 2, "type": "security", "label": "Finalize barrier", "sublabel": "every verdict must be true", "width": 170, "sources": [{"path": "wf.py", "line": 7250, "end_line": 7278}]},
+    {"id": "done", "lane": "runner", "col": 3, "type": "backend", "label": "run.done", "sublabel": "publication receipted", "width": 162, "sources": [{"path": "wf.py", "line": 7276, "end_line": 7278}]},
+    {"id": "blocked", "lane": "recovery", "col": 2, "type": "security", "label": "Blocked", "sublabel": "effect.unreceipted", "width": 170, "sources": [{"path": "wf.py", "line": 7260, "end_line": 7275}]},
+    {"id": "echo", "lane": "recovery", "col": 3, "type": "messagebus", "label": "Complete readback", "sublabel": "amend to echo-bank output", "width": 178, "sources": [{"path": "tests/test_effects_receipt_pygyy.py", "line": 359, "end_line": 389}]}
+  ],
+  "edges": [
+    {"id": "bank-receipt", "from": "bank", "to": "receipt", "label": "effects opted in"},
+    {"id": "receipt-barrier", "from": "receipt", "to": "barrier", "label": "checked metrics"},
+    {"id": "barrier-done", "from": "barrier", "to": "done", "label": "all proven", "variant": "emphasis"},
+    {"id": "barrier-blocked", "from": "barrier", "to": "blocked", "label": "false or absent", "role": "error", "variant": "security"},
+    {"id": "blocked-echo", "from": "blocked", "to": "echo", "label": "publication only", "variant": "dashed"},
+    {"id": "echo-barrier", "from": "echo", "to": "barrier", "label": "recheck", "role": "return", "variant": "dashed"}
+  ],
+  "cards": [
+    {"dot": "emerald", "title": "No re-authoring", "items": ["A missing receipt preserves the banked author's record and artifact.", "Unchanged resumes only re-read evidence; the author is not respawned."]},
+    {"dot": "cyan", "title": "Opt-in contract", "items": ["No effects declaration preserves existing behavior byte-for-byte.", "External adapters own remote readback; this gate neither infers nor performs remote writes."]}
+  ]
+}
