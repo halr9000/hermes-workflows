@@ -5,8 +5,7 @@
     "title": "External publication receipt barrier",
     "locale": "en",
     "quality_profile": "showcase",
-    "output": "work/est-ywa4.html",
-    "repository": {"url": "https://github.com/jacobhausler/hermes-workflows", "revision": "2e1f2fda2d772a6ea42fe02a24e479e9a371fe90", "provider": "github"}
+    "output": "work/est-ywa4.html"
   },
   "lanes": [
     {"id": "commit", "label": "Committed artifact and evidence"},
@@ -15,12 +14,12 @@
   ],
   "mainPath": ["bank", "receipt", "barrier", "done"],
   "nodes": [
-    {"id": "bank", "lane": "commit", "col": 0, "type": "database", "label": "Bank artifact", "sublabel": "done or partial record", "width": 162, "sources": [{"path": "wf.py", "line": 1083, "end_line": 1092}]},
-    {"id": "receipt", "lane": "commit", "col": 1, "type": "backend", "label": "Check receipt", "sublabel": "target / expected / actual", "width": 162, "sources": [{"path": "wfcommon.py", "line": 767, "end_line": 800}]},
-    {"id": "barrier", "lane": "runner", "col": 2, "type": "security", "label": "Finalize barrier", "sublabel": "every verdict must be true", "width": 170, "sources": [{"path": "wf.py", "line": 7250, "end_line": 7278}]},
-    {"id": "done", "lane": "runner", "col": 3, "type": "backend", "label": "run.done", "sublabel": "publication receipted", "width": 162, "sources": [{"path": "wf.py", "line": 7276, "end_line": 7278}]},
-    {"id": "blocked", "lane": "recovery", "col": 2, "type": "security", "label": "Blocked", "sublabel": "effect.unreceipted", "width": 170, "sources": [{"path": "wf.py", "line": 7260, "end_line": 7275}]},
-    {"id": "echo", "lane": "recovery", "col": 3, "type": "messagebus", "label": "Complete readback", "sublabel": "amend to echo-bank output", "width": 178, "sources": [{"path": "tests/test_effects_receipt_pygyy.py", "line": 359, "end_line": 389}]}
+    {"id": "bank", "lane": "commit", "col": 0, "type": "database", "label": "Bank artifact", "sublabel": "done or partial record", "width": 162},
+    {"id": "receipt", "lane": "commit", "col": 1, "type": "backend", "label": "Check receipt", "sublabel": "target / expected / actual", "width": 162},
+    {"id": "barrier", "lane": "runner", "col": 2, "type": "security", "label": "Finalize barrier", "sublabel": "every verdict must be true", "width": 170},
+    {"id": "done", "lane": "runner", "col": 3, "type": "backend", "label": "run.done", "sublabel": "publication receipted", "width": 162},
+    {"id": "blocked", "lane": "recovery", "col": 2, "type": "security", "label": "Blocked", "sublabel": "effect.unreceipted", "width": 170},
+    {"id": "echo", "lane": "recovery", "col": 3, "type": "messagebus", "label": "Complete readback", "sublabel": "amend to echo-bank output", "width": 178}
   ],
   "edges": [
     {"id": "bank-receipt", "from": "bank", "to": "receipt", "label": "effects opted in"},
