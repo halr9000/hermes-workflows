@@ -259,5 +259,117 @@ class EffectReceipt(unittest.TestCase):
                       "grammar.md must document the refusal copy")
 
 
+    # External publication receipts are committed evidence, not permission to
+    # rerun artifact authors. The finalize barrier must retain a done record.
+    TARGET = "https://example.invalid/pull/1#comment-2"
+    EXPECT = "report published"
+
+    def external(self):
+        return {"target": self.TARGET, "expected-readback": self.EXPECT}
+
+    def receipt(self, **changes):
+        row = dict(self.external(), **{"actual-readback": self.EXPECT, "verdict": True})
+        row.update(changes)
+        return row
+
+    def test_j_external_shape_closed_and_accepted(self):
+        for typ in ("agent", "echo"):
+            self.assertEqual(self._effect_errs([{
+                "id": "pub", "type": typ, "effects": [self.external()]}]), [])
+        for row in ({"target": self.TARGET},
+                    {"target": "", "expected-readback": self.EXPECT},
+                    {"target": self.TARGET, "expected-readback": False},
+                    dict(self.external(), file="out/report.json"),
+                    dict(self.external(), verdict=True)):
+            with self.subTest(row=row):
+                self.assertTrue(self._effect_errs([{
+                    "id": "pub", "type": "echo", "effects": [row]}]))
+
+    def test_k_missing_external_readback_blocks_without_reauthor(self):
+        r = self.mk("er-k", [{"id": "pub", "type": "agent",
+            "goal": "EFFECT-EMIT out/report.json BYTES=64 publish the report",
+            "effects": [self.external()]}])
+        out = self.wf("er-k")
+        self.assertNotIn("WORKFLOW_DONE", out)
+        rec = self.rec(r, "pub")
+        self.assertEqual(rec.get("status"), "done", "bank artifact; do not retry author")
+        art = r / "work/pub/out/report.json"
+        self.assertEqual(art.read_bytes(), ART)
+        before = rec.copy()
+        spawn_log = (self.home / "fake.log").read_bytes()
+        out2 = self.wf("er-k")
+        self.assertNotIn("WORKFLOW_DONE", out2)
+        self.assertEqual(self.rec(r, "pub"), before, "re-read must not reauthor the record")
+        self.assertEqual((self.home / "fake.log").read_bytes(), spawn_log)
+        self.assertEqual(art.read_bytes(), ART)
+        events = self.events(r)
+        recovery = [e for e in events if e.get("event") == "effect.unreceipted"]
+        self.assertTrue(recovery, "no publication-only recovery route")
+        self.assertTrue(all(e.get("node") == "pub" and
+                            e.get("recovery") == "publication-only" for e in recovery))
+        self.assertNotIn("run.done", [e.get("event") for e in events])
+        self.assertEqual(wfcommon.run_state(r)["status"], "failed")
+        rows = rec["metrics"]["effect_receipts"]
+        self.assertEqual(rows, [self.receipt(**{"actual-readback": None, "verdict": False})])
+
+    def test_l_external_false_absent_and_mismatched_evidence_blocks(self):
+        for i, receipt in enumerate((
+            self.receipt(verdict=False), self.receipt(verdict="true"),
+            self.receipt(verdict=1), self.receipt(**{"actual-readback": ""}),
+            self.receipt(**{"actual-readback": False}),
+            self.receipt(**{"actual-readback": "wrong"}),
+            {k: v for k, v in self.receipt().items() if k != "actual-readback"},
+            self.receipt(target="wrong"), self.receipt(**{"expected-readback": "wrong"}),
+        )):
+            with self.subTest(receipt=receipt):
+                rid = f"er-l{i}"
+                r = self.mk(rid, [{"id": "pub", "type": "echo",
+                    "output": {"effect_receipts": [receipt]}, "effects": [self.external()]}])
+                self.assertNotIn("WORKFLOW_DONE", self.wf(rid))
+                self.assertEqual(self.rec(r, "pub")["status"], "done")
+                self.assertEqual(wfcommon.run_state(r)["status"], "failed")
+                self.assertTrue(any(e.get("event") == "effect.unreceipted"
+                                    for e in self.events(r)))
+
+    def test_m_external_fixed_readback_done_and_metrics_visible(self):
+        r = self.mk("er-m", [{"id": "pub", "type": "echo",
+            "output": {"artifact": "report.json", "effect_receipts": [self.receipt()]},
+            "effects": [self.external()]}])
+        self.assertIn("WORKFLOW_DONE", self.wf("er-m"))
+        rec = self.rec(r, "pub")
+        self.assertEqual(rec["metrics"]["effect_receipts"], [self.receipt()])
+        self.assertEqual(wfcommon.run_state(r)["status"], "done")
+        # Exercise the actual door view; spending metrics must not hide receipts.
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("effects_door", ROOT / "__init__.py")
+        door = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(door)
+        with patch.object(door._common, "run_child_metrics", return_value={}):
+            view = door._view(r)
+        self.assertEqual(view["nodes"]["pub"]["metrics"]["effect_receipts"], [self.receipt()])
+
+    def test_n_publication_only_echo_recovery_preserves_committed_artifact(self):
+        # Public amend accepts the echo-bank replacement; only the receipt is
+        # completed, the already-written report never needs an author spawn.
+        r = self.mk("er-n", [{"id": "pub", "type": "agent",
+            "goal": "EFFECT-EMIT out/report.json BYTES=64 publish the report",
+            "effects": [self.external()]}])
+        self.assertNotIn("WORKFLOW_DONE", self.wf("er-n"))
+        art = r / "work/pub/out/report.json"
+        self.assertEqual(art.read_bytes(), ART)
+        before = (art.read_bytes(), art.stat().st_mtime_ns)
+        spawn_log = (self.home / "fake.log").read_bytes()
+        output = self.rec(r, "pub")["output"]
+        output = dict(output, effect_receipts=[self.receipt()])
+        graph = {"name": "er-n", "nodes": [{"id": "pub", "type": "echo",
+            "output": output, "effects": [self.external()]}]}
+        self.assertEqual(wfcommon.validate_graph_errors(graph["nodes"]), [])
+        (r / "graph.json").write_text(json.dumps(graph))
+        self.assertIn("WORKFLOW_DONE", self.wf("er-n"))
+        self.assertEqual((art.read_bytes(), art.stat().st_mtime_ns), before)
+        self.assertEqual((self.home / "fake.log").read_bytes(), spawn_log)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
