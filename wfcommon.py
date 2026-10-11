@@ -762,6 +762,41 @@ ECHO_KEYS = {"id", "type", "after", "output",
 # est-pygyy (issue #56): the closed shape of one effect-receipt row (validated at
 # the door, enforced by wf._effect_gate at the runner's commit edge).
 EFFECT_KEYS = {"file", "sha256", "min_bytes"}
+EXTERNAL_EFFECT_KEYS = {"target", "expected-readback"}
+
+def external_effect_receipts(node, rec):
+    """Validate committed publication evidence, never a license to redo its author.
+
+    External adapters own the remote readback. The runner checks that each
+    declaration has exactly one matching receipt, a literal true verdict and
+    non-empty actual evidence equal to the declared expectation. Metrics are
+    derived, not accepted as an alternate source of truth.
+    """
+    declared = [r for r in node.get("effects", []) if "target" in r]
+    if not declared:
+        return []
+    out = (rec or {}).get("output")
+    sources = [out]
+    if node.get("fanout") and isinstance(out, dict):
+        items = out.get("all_results")
+        items = items if isinstance(items, list) else []
+        sources = [item.get("output") for item in items
+                   if isinstance(item, dict) and item.get("status") in ("done", "partial")]
+    supplied = [r for source in sources if isinstance(source, dict)
+                and isinstance(source.get("effect_receipts"), list)
+                for r in source["effect_receipts"]]
+    rows = []
+    for row in declared:
+        target, expected = row["target"], row["expected-readback"]
+        matches = [r for r in supplied if isinstance(r, dict) and r.get("target") == target]
+        receipt = matches[0] if len(matches) == 1 else {}
+        actual = receipt.get("actual-readback")
+        proven = (receipt.get("verdict") is True
+                  and receipt.get("expected-readback") == expected
+                  and isinstance(actual, str) and bool(actual.strip()) and actual == expected)
+        rows.append({"target": target, "expected-readback": expected,
+                     "actual-readback": actual, "verdict": proven})
+    return rows
 _HEX64_OK = re.compile(r"^[0-9a-f]{64}$")
 JOIN_KEYS = {"id", "type", "after", "keys", "wait"}
 # ONE table for node kinds: closed key-set + the schedule hook. `spawns` is True
@@ -1283,9 +1318,11 @@ def validate_graph_errors(nodes, *, admission=False):
             # engine never infers effects from prose; a declared receipt that cannot
             # be proven fails the node typed (error_class effect_receipt), so the
             # door validates the SHAPE fail-closed here: non-empty list <=8 rows,
-            # each {file, sha256?, min_bytes?} (closed keys; file is a run-dir
-            # relative path — absolute and escaping paths are refused HERE, never
-            # discovered at the commit edge).
+            # each local {file, sha256?, min_bytes?} or external
+            # {target, expected-readback}. External adapters record remote
+            # evidence in output.effect_receipts; a false/absent receipt blocks
+            # finalize without invalidating the committed artifact author.
+            # Local paths are run-dir relative; escaping paths are refused here.
             ef = n["effects"]
             if not isinstance(ef, list) or not ef:
                 E(nid, "effects", "effects must be a non-empty list of effect-receipt "
@@ -1299,10 +1336,17 @@ def validate_graph_errors(nodes, *, admission=False):
                         E(nid, fld, "each effect receipt must be an object "
                                     "{file, sha256?, min_bytes?}")
                         continue
-                    stray = sorted(set(row) - EFFECT_KEYS)
+                    allowed = EXTERNAL_EFFECT_KEYS if "target" in row else EFFECT_KEYS
+                    stray = sorted(set(row) - allowed)
                     if stray:
                         E(nid, fld, f"{fld} unknown key(s) {stray}; allowed: "
-                                    "file, sha256, min_bytes")
+                                    + ", ".join(sorted(allowed)))
+                    if "target" in row:
+                        for key in sorted(EXTERNAL_EFFECT_KEYS):
+                            value = row.get(key)
+                            if not isinstance(value, str) or not value.strip():
+                                E(nid, fld, f"{fld} {key} must be a non-empty string")
+                        continue
                     f_ = row.get("file")
                     if not isinstance(f_, str) or not f_.strip():
                         E(nid, fld, f"{fld} file must be a non-empty string")
@@ -3755,6 +3799,10 @@ def run_state(r):
         nodes[n["id"]] = {"type": n["type"], "status": "running" if active else st, "after": n.get("after", []),
                           "fanout": bool(n.get("fanout")),
                           "stale_of_amend": bool(rec) and st == "pending" and rec.get("status") in ("done", "partial", "failed", "skipped") or None}
+        if st in ("done", "partial"):
+            receipts = external_effect_receipts(n, rec)
+            if receipts:
+                nodes[n["id"]]["metrics"] = {"effect_receipts": receipts}
         if active:
             nodes[n["id"]]["active_spawn"] = active[0]
             nodes[n["id"]]["active_spawns"] = active
@@ -3840,6 +3888,11 @@ def run_state(r):
     for n in graph["nodes"]:
         if states[n["id"]] == "pending" and not deps_ok(n):
             nodes[n["id"]]["blocked_by"] = blocked_by(n, states, meta)
+    unreceipted = any(not row["verdict"] for n in graph["nodes"]
+                      if states[n["id"]] in ("done", "partial")
+                      for row in external_effect_receipts(n, recs[n["id"]]))
+    if unreceipted and status == "done":
+        status = "failed"  # committed artifacts remain done; publication is owed
     exit_state = runner_exit_read(r)
     # Honest status: the runner's own graph-bound verdict in runner_exit.json
     # OUTRANKS the pid-liveness guess. A fresh runner deletes the record at boot
@@ -3847,7 +3900,7 @@ def run_state(r):
     # process that already exited — a recycled/stale pid reading "live" must not
     # keep a finished run looking running (or an exited one look resumable).
     verdict = str((exit_state or {}).get("reason") or "")
-    if verdict == "done" and not any(s == "failed" for s in states.values()):
+    if verdict == "done" and not unreceipted and not any(s == "failed" for s in states.values()):
         status = "done"
     elif verdict == "stopped":
         status = "stopped"

@@ -343,11 +343,18 @@ class EffectReceipt(unittest.TestCase):
         import importlib.util
         from unittest.mock import patch
         spec = importlib.util.spec_from_file_location("effects_door", ROOT / "__init__.py")
+        self.assertIsNotNone(spec)
         door = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(door)
-        with patch.object(door._common, "run_child_metrics", return_value={}):
-            view = door._view(r)
-        self.assertEqual(view["nodes"]["pub"]["metrics"]["effect_receipts"], [self.receipt()])
+        state = door.run_state(r)
+        fake_metrics = {f"wf:er-m:pub:{rec['efp'][:8]}": {
+            "tokens_in": 1, "tokens_out": 2, "api_calls": 1, "tool_calls": 3,
+            "cost": 0, "sessions": {}, "ended": True}}
+        for spending in ({}, fake_metrics):
+            with patch.object(door, "_resolve_read_run", return_value=(r, state, None)), \
+                    patch.object(door._common, "run_child_metrics", return_value=spending):
+                view = door.act_status({"run_id": r.name})
+            self.assertEqual(view["nodes"]["pub"]["metrics"]["effect_receipts"], [self.receipt()])
 
     def test_n_publication_only_echo_recovery_preserves_committed_artifact(self):
         # Public amend accepts the echo-bank replacement; only the receipt is
@@ -365,10 +372,52 @@ class EffectReceipt(unittest.TestCase):
         graph = {"name": "er-n", "nodes": [{"id": "pub", "type": "echo",
             "output": output, "effects": [self.external()]}]}
         self.assertEqual(wfcommon.validate_graph_errors(graph["nodes"]), [])
-        (r / "graph.json").write_text(json.dumps(graph))
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("effects_recovery_door", ROOT / "__init__.py")
+        door = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(door)
+        import wf_test_isolation as _iso71
+        _iso71.install(door)
+        with patch.dict(os.environ, {"WF_RUNS_ROOT": str(self.runs)}), \
+                patch.object(door, "run_dir", return_value=r), \
+                patch.object(door, "_spawn_runner", return_value=None):
+            amended = door.act_amend({"run_id": r.name, "graph": graph})
+        self.assertNotIn("error", amended, amended)
         self.assertIn("WORKFLOW_DONE", self.wf("er-n"))
         self.assertEqual((art.read_bytes(), art.stat().st_mtime_ns), before)
         self.assertEqual((self.home / "fake.log").read_bytes(), spawn_log)
+
+
+    def test_o_partial_and_fanout_external_receipts_are_fail_closed(self):
+        # A precommitted partial must not bypass the finalize barrier; a fanout
+        # must supply each declared target from its banked item records.
+        for fanout, status in ((False, "partial"), (True, "done")):
+            for verdict in (False, True):
+                rid = f"er-o-{fanout}-{verdict}"
+                node = {"id": "pub", "type": "agent", "goal": "banked artifact",
+                        "effects": [self.external()]}
+                output = {"effect_receipts": [self.receipt(verdict=verdict)]}
+                if fanout:
+                    node["fanout"] = {"items": ["banked"]}
+                    output = {"all_results": [{"status": "done", "output": output}]}
+                r = self.mk(rid, [node])
+                wf.save_node(r, node, {"pub": node}, {"status": status, "output": output})
+                out = self.wf(rid)
+                self.assertEqual("WORKFLOW_DONE" in out, verdict)
+                self.assertEqual(wfcommon.run_state(r)["status"], "done" if verdict else "failed")
+                self.assertEqual(self.rec(r, "pub")["status"], status)
+                if not verdict:
+                    # Even a same-graph stale done exit cannot override missing proof.
+                    wf.write_runner_exit(r, "done", graph=json.loads((r / "graph.json").read_text()))
+                    self.assertEqual(wfcommon.run_state(r)["status"], "failed")
+        node = {"effects": [self.external()], "fanout": {"items": [1]}}
+        for malformed in ({"all_results": None}, {"all_results": "bad"}):
+            self.assertFalse(wfcommon.external_effect_receipts(node, {"output": malformed})[0]["verdict"])
+        node = {"effects": [self.external()]}
+        for supplied in (None, {}, [self.receipt(), self.receipt()]):
+            self.assertFalse(wfcommon.external_effect_receipts(
+                node, {"output": {"effect_receipts": supplied}})[0]["verdict"])
 
 
 if __name__ == "__main__":

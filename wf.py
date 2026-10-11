@@ -1112,6 +1112,8 @@ def _effect_gate(run, node, rec):
         return rec                        # undeclared / non-committing: untouched
     proven, failures = [], []
     for row in rows:
+        if "target" in row:
+            continue  # external evidence is a finalize barrier, not an author retry
         f = str(row.get("file", ""))
         entry = {"file": f, "exists": False, "bytes": 0, "sha256": None, "ok": False}
         p = Path(run) / f
@@ -1135,12 +1137,17 @@ def _effect_gate(run, node, rec):
         else:
             failures.append(f"{f}: path escapes the run dir")
         proven.append(entry)
-    rec = dict(rec, effect_receipts=proven)
+    if proven:
+        rec = dict(rec, effect_receipts=proven)
+    external = wfcommon.external_effect_receipts(node, rec)
+    if external:
+        rec = dict(rec, metrics={**rec.get("metrics", {}), "effect_receipts": external})
     if failures:
         rec = {"status": "failed",
                "error": "effect_receipt_unproven: " + "; ".join(failures),
                "error_class": "effect_receipt",
                "effect_receipts": proven,
+               **({"metrics": rec["metrics"]} if external else {}),
                "output": rec.get("output"), "ms": rec.get("ms")}
     return rec
 
@@ -7241,6 +7248,28 @@ def main(run_id):
             if m == "reloaded": continue
             return "blocked by failed " + ",".join(n["id"] for n in failed)
         if all(states[n["id"]] in ("done", "partial", "skipped") for n in rs.nodes):   # #4: a harvested partial closes the run
+            unreceipted = []
+            for n in rs.nodes:
+                if states[n["id"]] == "skipped":
+                    continue
+                _st, rec = node_rec(run, n, rs.byid)
+                receipts = wfcommon.external_effect_receipts(n, rec)
+                missing = [r["target"] for r in receipts if not r["verdict"]]
+                if missing:
+                    unreceipted.append(n["id"])
+                    log(run, "effect.unreceipted", node=n["id"], missing=missing,
+                        recovery="publication-only")
+            if unreceipted:
+                # Bank done/partial authors. A wait only re-reads; recovery must
+                # complete publication and echo-bank the original output via amend.
+                log(run, "run.blocked", failed=[], blocked=unreceipted,
+                    recovery="publication-only", error_class="effect_receipt")
+                emit(f"WORKFLOW_FAILED {run_id} (effect receipt {','.join(unreceipted)})")
+                notify(run, "run.failed", key="effect receipt", graph=rs.graph)
+                m = consume_markers()
+                if m == "stopped": return "stopped"
+                if m == "reloaded": continue
+                return "blocked by effect receipt " + ",".join(unreceipted)
             finalize(run, rs.graph, "done")
             return "done"
         emit(f"WORKFLOW_FAILED {run_id} (graph stuck — check after/refs)")
@@ -7273,6 +7302,7 @@ def main(run_id):
             if not (isinstance(reason, str) and
                     (reason.startswith("held at ") or
                      reason.startswith("blocked by failed ") or
+                     reason.startswith("blocked by effect receipt ") or
                      reason == "graph stuck")):
                 break
             # Terminal handoff fence: make liveness false BEFORE the final action

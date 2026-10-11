@@ -3241,6 +3241,8 @@ def act_status(args):
                                         if k not in ("argv", "spawn_cmd")}
             out["nodes"][nid]["active_spawn"] = _trim(v["active_spawn"])
             out["nodes"][nid]["active_spawns"] = [_trim(sp) for sp in v.get("active_spawns") or []]
+        if v.get("metrics"):
+            out["nodes"][nid]["metrics"] = v["metrics"]
         if v.get("blocked_by"):
             out["nodes"][nid]["blocked_by"] = v["blocked_by"]
         if v.get("parked"):
@@ -3327,7 +3329,7 @@ def act_status(args):
                 line["idle_s"] = int(_t.time() - la) if la is not None else None
                 line["last"] = current["last_desc"]
                 line["last_tool_at"] = la  # #18: the epoch of the last verified activity
-            out["nodes"][nid]["metrics"] = line
+            out["nodes"][nid]["metrics"] = {**out["nodes"][nid].get("metrics", {}), **line}
             # #127 (est-zsws): the heartbeat verdict rides EVERY running node's
             # status line — derived from the fold just built plus the #128
             # progress artifact age. Read model only: no writes, no key for a
