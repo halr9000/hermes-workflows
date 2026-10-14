@@ -2233,10 +2233,13 @@ def act_library(args):
         if row is None:
             return _from_unknown_error(name)
         launch = {"action": "run", "from": name}
+        # est-kg3y: an UNFILLED required input prints "" (the door refuses an empty
+        # value by name). A "<KEY>" placeholder is a non-empty string the door would
+        # accept and launch as a literal — the .572 phantom class — so it is never printed.
+        unfilled = sorted(k for k, v in (row.get("params") or {}).items() if "default" not in v)
         if row.get("params"):
-            launch["run_context"] = {k: v.get("default", f"<{k}>")
-                                     for k, v in row["params"].items()}
-        return {"entry": dict(row, instantiate=launch,
+            launch["run_context"] = {k: v.get("default", "") for k, v in row["params"].items()}
+        return {"entry": dict(row, instantiate=launch, unfilled=unfilled,
                               command="workflow " + json.dumps(launch, ensure_ascii=False))}
     # Preserve the bare-library hint; populated recipes remain optional reuse.
     hinted = "workflow run from=<name> replays one; workflow save graph=... shelves a new one"
@@ -2321,6 +2324,19 @@ def act_validate(args):
         _rd = run_dir(args["run_id"])
         if not (_rd / "graph.json").exists():
             return {"error": "unknown run_id"}
+    # est-kg3y s12 (dag_lint parity): a library ENVELOPE is {meta, graph}. Validate the
+    # graph body and surface meta.params disagreement as warn rows — never fatal, same
+    # wording the save door uses. A bare graph has no declaration to disagree with.
+    warnings = []
+    if isinstance(graph, dict) and isinstance(graph.get("graph"), dict) and "nodes" not in graph:
+        entry = _common.library_entry(graph)
+        if "graph" in entry:
+            contract = _common.run_context_contract(entry["graph"], (entry.get("meta") or {}).get("params"))
+            if contract["missing"]:
+                warnings.append("s12 uncontracted run_context refs: " + ", ".join(contract["missing"]))
+            if contract["dead"]:
+                warnings.append("s12 dead declared params: " + ", ".join(contract["dead"]))
+            graph = entry["graph"]
     bad = _validation_error(graph, run_dir=_rd)
     if bad:
         return dict(bad, ok=False)
@@ -2336,8 +2352,11 @@ def act_validate(args):
     if err:
         return {"ok": False, "error": err,
                 "errors": [{"node": None, "field": "model", "msg": err}]}
-    return {"ok": True, "errors": [], "resolved_routes": routes,
-            "hint": "validated only — nothing pinged or written; run it: workflow run graph=..."}
+    out = {"ok": True, "errors": [], "resolved_routes": routes,
+           "hint": "validated only — nothing pinged or written; run it: workflow run graph=..."}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 # ---------- actions ----------
 
@@ -2830,6 +2849,16 @@ def act_run(args):
         if refs and not isinstance(binding, dict):
             return {"error": "library run_context must bind non-empty string values for: "
                              + ", ".join(refs) + "; refused before any write or spawn"}
+        # est-kg3y: the exact placeholder the instantiate surface used to print is a
+        # non-empty string, so the value check alone would launch it literally. Refuse
+        # it for every ref'd key, even when pasted from an older printout.
+        if refs and isinstance(binding, dict):
+            stale = [k for k in refs
+                     if isinstance(binding.get(k), str) and binding[k].strip() == f"<{k}>"]
+            if stale:
+                return {"error": "library run_context value is the instantiate placeholder "
+                                 "<KEY> for: " + ", ".join(stale) + "; supply the real value "
+                                 "— refused before any write or spawn"}
     if "run_context" in args:
         try:
             graph = _bind_run_context(graph, args["run_context"], library_sourced=bool(lib_name))
@@ -4027,9 +4056,22 @@ def _wf_command(raw_args):
         if "error" in detail:
             return detail["error"]
         entry = detail["entry"]
-        return (f"Workflow **{entry['name']}** — required inputs: "
-                + (", ".join(entry.get("params", {})) or "(none)")
-                + "\n" + entry["command"])
+        lines = [f"Workflow **{entry['name']}** — required inputs: "
+                 + (", ".join(entry.get("params", {})) or "(none)")]
+        for k, spec in (entry.get("params") or {}).items():
+            line = f"  - {k}"
+            if spec.get("desc"):
+                line += f": {spec['desc']}"
+            if "default" in spec:
+                line += f" (suggested default: {spec['default']})"
+            else:
+                line += " — fill this (empty until supplied)"
+            lines.append(line)
+        if entry.get("unfilled"):
+            lines.append("Fill every empty run_context value, then run "
+                         "(the door refuses an empty value by name):")
+        lines.append(entry["command"])
+        return "\n".join(lines)
     out = act_library({})
     lib = out["library"]
     quarantined = out.get("quarantined") or []

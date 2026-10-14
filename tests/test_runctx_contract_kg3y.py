@@ -275,6 +275,51 @@ check("S8 malformed meta.params never quarantines the entry; params derive from 
       and "malformed" not in json.dumps(out.get("quarantined", []))
       and set((rows["malformed"].get("params") or {})) == {"X"}, json.dumps(rows.get("malformed"))[:250])
 
+# ---------- 2b. est-kg3y round 2: the instantiate surface must not mint a phantom.
+# The printed instantiate command used to carry "<KEY>" for every required input
+# with no default. That is a NON-EMPTY string, so the door accepted it and a
+# copy-pasted command launched a literal placeholder (the .572 phantom class,
+# re-entering through the instantiate surface). Unfilled inputs now print "" (the
+# door refuses it by name), and an exact <KEY> placeholder for a ref'd key is
+# refused on a library launch even when pasted from an older printout.
+det = call(action="library", **{"name": "declared"})
+ent = det.get("entry") or {}
+ctx = (ent.get("instantiate") or {}).get("run_context") or {}
+check("P1 instantiate prints no <KEY> placeholder value (phantom surface)",
+      bool(ctx) and not any(isinstance(v, str) and v.startswith("<") and v.endswith(">")
+                            for v in ctx.values()), json.dumps(ctx)[:200])
+check("P1b entry names the unfilled required inputs (no default)",
+      ent.get("unfilled") == ["JOB", "OPTION", "SUITE", "VERDICT"], json.dumps(ent)[:300])
+before = (len(spawns), dirs())
+legacy = {k: f"<{k}>" for k in ALL_KEYS}
+r = call(**{"action": "run", "from": "declared", "run_context": legacy, "dry_run": True})
+check("P2 pasted legacy <KEY> placeholders refused on a library launch (no write)",
+      "error" in r and "placeholder" in r.get("error", "") and (len(spawns), dirs()) == before,
+      json.dumps(r)[:200])
+txt = hw._wf_command("show declared")
+check("P3 /wf show gives each required input's desc and says to fill before running",
+      "the suite command" in txt and "fill" in txt.lower() and "run_context" in txt, txt[:400])
+
+# ---------- 2c. s12 as lint rows: validate reads a library envelope (dag_lint parity)
+v = call(action="validate", graph_path=str(LIB / "declared.json"))
+check("V1 validate reads an envelope path (no 'unknown graph key') and stays ok",
+      v.get("ok") is True and "unknown graph key" not in json.dumps(v), json.dumps(v)[:300])
+check("V1b validate names a dead declared param as an s12 warn row",
+      any("s12 dead declared params: UNUSED" in str(w) for w in (v.get("warnings") or [])),
+      json.dumps(v)[:300])
+(HOME / "v-missing.json").write_text(json.dumps({
+    "meta": {"description": "missing", "params": {"SUITE": {"desc": "s"}}},
+    "graph": {"name": "vmissing", "nodes": [
+        {"id": "a", "type": "agent", "goal": "run {run.SUITE} {run.JOB}", "shape": "recon"}]}}))
+v2 = call(action="validate", graph_path=str(HOME / "v-missing.json"))
+check("V2 validate names an uncontracted ref as an s12 warn row",
+      any("s12 uncontracted run_context refs: JOB" in str(w) for w in (v2.get("warnings") or [])),
+      json.dumps(v2)[:300])
+v3 = call(action="validate", graph={"name": "bare", "nodes": [
+    {"id": "a", "type": "agent", "goal": "run {run.SUITE}", "shape": "recon"}]})
+check("V3 bare graph validate carries no warnings key (golden bytes)",
+      "warnings" not in v3, json.dumps(v3)[:200])
+
 # ---------- 4. engine-truth contract function (single predicate, shared)
 check("E1 _common.run_context_contract is the shared predicate",
       callable(getattr(hw._common, "run_context_contract", None)))
