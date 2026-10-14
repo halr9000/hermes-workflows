@@ -88,7 +88,9 @@ class MetricsUnknownFold114(unittest.TestCase):
         tmp.mkdir(parents=True)
         st["run_dir"] = tmp
         fake_common = types.SimpleNamespace(
-            run_state=lambda r: dict(st),
+            # (#44 keeps the forge honest: plugin_api._view threads a lock_state
+            # kwarg into run_state — the forged read ignores it, est-lf0j pattern.)
+            run_state=lambda r, lock_state=None: dict(st),
             run_child_metrics=lambda r: dict(cm),
             current_attempt=WFC.current_attempt,        # the REAL heartbeat fn
             node_facts=lambda r, nid, index=None: None,
