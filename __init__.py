@@ -33,6 +33,13 @@ assert _ce_spec is not None and _ce_spec.loader is not None
 _card_enforcement = importlib.util.module_from_spec(_ce_spec)
 _ce_spec.loader.exec_module(_card_enforcement)
 
+# PR-5 telemetry: default-off observers (sizes/statuses only), bound to OUR wfcommon.
+_tel_spec = importlib.util.spec_from_file_location("_hermes_workflows_telemetry",
+                                                   Path(__file__).resolve().parent / "telemetry_observers.py")
+assert _tel_spec is not None and _tel_spec.loader is not None
+_telemetry = importlib.util.module_from_spec(_tel_spec)
+_tel_spec.loader.exec_module(_telemetry)
+_telemetry.bind(_common)
 # PR-3: admission-gate index + dispatch witness — bound by path like its siblings.
 _gi_spec = importlib.util.spec_from_file_location("_hermes_workflows_gate_index",
                                                   Path(__file__).resolve().parent / "gate_index.py")
@@ -711,8 +718,8 @@ WORKFLOW_PARAMS = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["run", "status", "wait", "release", "release_lock", "steer", "inbox", "amend", "diff", "stop", "list", "save", "submit", "library", "doctor_version", "validate"],
-            "description": "run=launch a graph; wait=read state, RESPAWNING an idle runner if work is pending (blocks to the next boundary when one is live; when the lock is PROVEN wedged — Errno 11 with the kernel ledger showing zero holders and the admission lease dead — wait heals it first, the #44 escape hatch); status=read-model of a run; release=answer a held human gate; release_lock=operator hatch for a wedged runner.lock (#44): renames the stranded inode aside under the admission heal-barrier and hands the lane a fresh lock path — REFUSES unless zero live holders are proven (never heals on EACCES or a live holder); steer=queue steering text for a node; inbox=(child-side, cooperative) pull late steering lines baked for THIS spawn — call once at a natural seam; amend=replace the graph (invalidates changed nodes + all downstream by fingerprint), or pass patch to edit a few node fields without resubmitting the whole graph; diff=confirm surface: runs the amend door with dry_run FORCED (accepts patch or graph), returns the preview + graph_diff and touches nothing; stop=request stop; list=all runs; save=shelve a graph in the library under a name (from run_id or inline graph); library=list shelved graphs richly (name, description, tags, provenance, path-relative id). validate=dry-run the door's validation pipeline (defaults fill + defect collection + model/route policy) with no ping and no writes; returns {ok, errors:[{node,field,msg}], resolved_routes}. run from=<name> replays a shelved graph. submit=quarantine a hand-rolled graph for study (requires why_not_library >=80 chars; never joins the library — the quartermaster's human-gated loop decides); inbox kind=submissions lists them newest-first. doctor_version=read-only version truth for THIS install: {live_version, newest_packaged, source_commit, drift} comparing plugin.yaml against the install.json provenance that pack.py stamps at build time \u2014 one read, no network.",
+            "enum": ["run", "status", "wait", "release", "release_lock", "steer", "inbox", "amend", "diff", "stop", "list", "save", "submit", "library", "doctor_version", "doctor", "validate"],
+            "description": "run=launch a graph; wait=read state, RESPAWNING an idle runner if work is pending (blocks to the next boundary when one is live; when the lock is PROVEN wedged — Errno 11 with the kernel ledger showing zero holders and the admission lease dead — wait heals it first, the #44 escape hatch); status=read-model of a run; release=answer a held human gate; release_lock=operator hatch for a wedged runner.lock (#44): renames the stranded inode aside under the admission heal-barrier and hands the lane a fresh lock path — REFUSES unless zero live holders are proven (never heals on EACCES or a live holder); steer=queue steering text for a node; inbox=(child-side, cooperative) pull late steering lines baked for THIS spawn — call once at a natural seam; amend=replace the graph (invalidates changed nodes + all downstream by fingerprint), or pass patch to edit a few node fields without resubmitting the whole graph; diff=confirm surface: runs the amend door with dry_run FORCED (accepts patch or graph), returns the preview + graph_diff and touches nothing; stop=request stop; list=all runs; save=shelve a graph in the library under a name (from run_id or inline graph); library=list shelved graphs richly (name, description, tags, provenance, path-relative id). validate=dry-run the door's validation pipeline (defaults fill + defect collection + model/route policy) with no ping and no writes; returns {ok, errors:[{node,field,msg}], resolved_routes}. run from=<name> replays a shelved graph. submit=quarantine a hand-rolled graph for study (requires why_not_library >=80 chars; never joins the library — the quartermaster's human-gated loop decides); inbox kind=submissions lists them newest-first. doctor_version=read-only version truth for THIS install: {live_version, newest_packaged, source_commit, drift} comparing plugin.yaml against the install.json provenance that pack.py stamps at build time \u2014 one read, no network. doctor=sub:version (same as doctor_version) | sub:budgets (read-only calibration table from the opt-in telemetry corpus + finished node records; n<20 cells print insufficient(n); applies nothing).",
         },
         "run_id": {"type": "string", "description": "Run id (required for every action except run/list)."},
         "name": {"type": "string", "description": "run: overrides graph.name (default workflow); save: library name overrides graph.name (lowercase, [-_.]); library: return one entry with refs-derived required params and an instantiate command. amend: set graph.name in the replacement graph; omitting it retains the run name."},
@@ -4201,11 +4208,29 @@ def act_doctor_version(args):
             "drift": bool(packaged is not None and live is not None and packaged != live)}
 
 
+def act_doctor(args):
+    """`doctor` verb: sub=version (default, = doctor_version) | sub=budgets (PR-5, read-only
+    calibration table from the telemetry corpus + finished node records; applies nothing)."""
+    sub = args.get("sub") or "version"
+    if sub == "version":
+        return act_doctor_version(args)
+    if sub != "budgets":
+        return {"error": f"unknown doctor sub {sub!r}", "subs": ["budgets", "version"]}
+    p = HERE / "scripts" / "doctor_budgets.py"
+    if not p.is_file():
+        return {"error": f"doctor budgets unavailable: {p} missing"}
+    spec = importlib.util.spec_from_file_location("_hermes_workflows_doctor_budgets", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    rep = m.report(_common.runs_root())
+    return {"report": rep, "text": m.render(rep)}
+
+
 ACTIONS = {"run": act_run, "status": act_status, "wait": act_wait, "release": act_release,
            "release_lock": act_release_lock,
            "steer": act_steer, "inbox": act_inbox, "amend": act_amend, "diff": act_diff, "stop": act_stop, "list": act_list,
            "save": act_save, "submit": act_submit, "library": act_library,
-           "doctor_version": act_doctor_version, "validate": act_validate}
+           "doctor_version": act_doctor_version, "doctor": act_doctor, "validate": act_validate}
 
 def handle(args, **kwargs):
     try:
@@ -4471,6 +4496,7 @@ def register(ctx):
     ctx.register_hook("post_tool_call", _card_enforcement._post_tool_call)
     ctx.register_hook("pre_llm_call", _card_enforcement._pre_llm_call)
     ctx.register_hook("transform_llm_output", _card_enforcement._card_hook)
+    _telemetry.install_hooks(ctx)   # PR-5: only when settings.telemetry is true (default off)
     # PR-3: both default-off (flags read at call time); a core without the hook just ignores.
     for _hook, _fn in (("post_gateway_admission", _admission_handler),
                        ("pre_gateway_dispatch", _dispatch_witness)):

@@ -20,7 +20,7 @@ SOURCE = Path(__file__).resolve().parent.parent
 work = Path(tempfile.mkdtemp(prefix="wf-terminal-boundary-"))
 copy = work / "plugin"
 (copy / "tests").mkdir(parents=True)
-for f in ("__init__.py", "card_enforcement.py", "card_ledger.py", "gate_index.py", "wf.py", "wfcommon.py", "wf_dialect.py", "plugin.yaml"):
+for f in ("__init__.py", "card_enforcement.py", "card_ledger.py", "telemetry_observers.py", "gate_index.py", "wf.py", "wfcommon.py", "wf_dialect.py", "plugin.yaml"):
     shutil.copy2(SOURCE / f, copy / f)
 for f in ("fake", "fake_hermes.py", "wf_test_isolation.py"):
     shutil.copy2(SOURCE / "tests" / f, copy / "tests" / f)

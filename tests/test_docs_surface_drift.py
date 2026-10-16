@@ -153,7 +153,7 @@ check("6b no action appears twice in the README action table",
 # The actual-dispatch comparison below must instead fail 7a naming `probe`.
 def _mutated_door(extra_key: str):
     tmp = Path(tempfile.mkdtemp(prefix=".tmp-door-mut-"))
-    for f in ("__init__.py", "wfcommon.py", "card_enforcement.py", "card_ledger.py", "gate_index.py"):
+    for f in ("__init__.py", "wfcommon.py", "card_enforcement.py", "card_ledger.py", "telemetry_observers.py", "gate_index.py"):
         (tmp / f).write_bytes((root / f).read_bytes())
     p = tmp / "__init__.py"
     src = p.read_text(encoding="utf-8")

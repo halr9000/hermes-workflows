@@ -79,6 +79,7 @@ INCLUDE_FILES = (
     "README.md",
     "SKILL.md",
     "__init__.py",
+    "telemetry_observers.py",  # PR-5: imported by __init__.py at bind time
     "card_ledger.py",  # imported by __init__.py at bind time (hook-led card ledger)
     "gate_index.py",  # PR-3: imported by __init__.py at bind time
     "docs/admission-gates.md",
@@ -141,6 +142,7 @@ INCLUDE_FILES = (
     # (spec_from_file_location) — the exact est-4vnq finding-4 shape. Stdlib-only,
     # so the ZIP side stays honest.
     "scripts/pr_formal_review.py",
+    "scripts/doctor_budgets.py",  # PR-5: loaded by the doctor verb (sub=budgets)
     "scripts/suite.py",
     ".graphifyignore",
     "tests/fake",
