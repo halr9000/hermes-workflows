@@ -144,33 +144,38 @@ scripts/vendor/archify/renderers/shared/generated-brand-marks.mjs
 tests/fake_bd_close_13z1.py
 tests/test_bead_close_claim_13z1.py
 references/grammar.md:48
-wf.py:1159
-wf.py:1164
-wf.py:1165
-wf.py:1180
-wf.py:1207
-wf.py:1208
-wf.py:1230
-wf.py:1234
-wf.py:1241
-wf.py:1734
-wf.py:1740
-wf.py:1741
-wf.py:1742
-wf.py:1743
-wf.py:1744
-wf.py:1746
-wf.py:1748
-wf.py:1755
-wf.py:1861
-wf.py:1862
-wf.py:4998
-wf.py:6796
-wfcommon.py:784
+# est-13z1 line anchors RE-ANCHORED at main 15a1b8a (main red since ee5018d: #360 squash-merged
+# after #439/#324 shifted wf.py, so its pre-merge anchors no longer matched; run 38827924093
+# failed test_personal_path_scrub_867). Exact current hit lines of the bead-close gate only —
+# any other wf.py/wfcommon.py edit that moves them must re-anchor in the same PR.
+wf.py:1256
+wf.py:1259
+wf.py:1264
+wf.py:1265
+wf.py:1280
+wf.py:1307
+wf.py:1308
+wf.py:1330
+wf.py:1334
+wf.py:1341
+wf.py:1834
+wf.py:1840
+wf.py:1841
+wf.py:1842
+wf.py:1843
+wf.py:1844
+wf.py:1846
+wf.py:1848
+wf.py:1855
+wf.py:1961
+wf.py:1962
+wf.py:5313
+wf.py:7142
 wfcommon.py:785
-wfcommon.py:1402
+wfcommon.py:786
 wfcommon.py:1403
 wfcommon.py:1404
+wfcommon.py:1405
 # ---- est-o8c6o (2026-10-11): the diff-scoped gate re-worded the ::error:: line ----
 # est-q2nwx's line anchor (:32) went stale because the diff-scope re-word moved the
 # citation line and kept the same mandated standard citation. Anchored by the citation
@@ -179,22 +184,3 @@ wfcommon.py:1404
 # rule 4 - same class as est-q2nwx.
 regex:haus-docs rules/pr-diagram-standard
 references/grammar.md:37
-wf.py:1147
-wf.py:1150
-wf.py:1155
-wf.py:1156
-wf.py:1171
-wf.py:1198
-wf.py:1199
-wf.py:1221
-wf.py:1225
-wf.py:1232
-wf.py:1724
-wf.py:1730
-wf.py:1731
-wf.py:1732
-wf.py:1733
-wf.py:1736
-wf.py:1738
-wf.py:1745
-wf.py:1851
