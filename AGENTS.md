@@ -490,6 +490,9 @@ draw the example workflow diagrams in `examples/README.md`, which DO ship.)
    subset; a human reviewer checks the rest.
 7. **Stdlib-only Python; host imports lazy and guarded.** A local-backend Mac runs
    the plugin under system Python with neither `hermes_cli` nor PyYAML on path.
+   Every private core import is a reasoned allow-list row in
+   [tests/test_private_core_imports.py](tests/test_private_core_imports.py), which pins
+   core's `hermes plugins validate` private-import lint (core ≥ v0.22.0).
 8. **Honest degradation over hidden failure.** If a field is absent (untyped turn
    report, missing metrics row), say `unknown`; never fabricate a value.
 9. **Receipts state per-lap facts as facts and totals as pointers into the
