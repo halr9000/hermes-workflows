@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- feat(validate): hold-vs-wall admission law (#475, est-xtopx). A `hold_timeout`
+  longer than every lane the graph can build is a structurally guaranteed
+  mid-collection death (receipt: owners lane 10800 shepherding gates that hold
+  to the 86400 ceiling). The door now resolves every lane's wall statically
+  (node timeout > shape preset > graph defaults > DEFAULT_SHAPE preset — the
+  same precedence `apply_graph_defaults` bakes) and REFUSES a gate that can out
+  its graph's max lane wall while it has after-consumers (admission-only, R10:
+  persisted graphs and respawns are never stranded). The softer relation — a
+  gate that can hold past ONE consumer's own wall while the graph survives the
+  max-wall law — rides the save/validate/run warnings channel naming both
+  numbers (dict rows, s12-union law #421). Graph-level `defaults` now reach the
+  shared validator through a new `defaults=` kwarg on `validate_graph_errors`.
+  Grammar in `references/grammar.md` (Gates); pins in
+  `tests/test_wall_invariant_475.py`.
 - docs(v1.4.0): revitalization pass — README drift fixes (`/wf <name>` returns
   a run instruction, `/wf gates` behind `admission_gates`, `library name:` /
   `amend patch` forms documented), four spec-backed showcase diagrams under

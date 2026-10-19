@@ -1340,7 +1340,155 @@ def budget_shape_errors(b, where):
     return errs
 
 
-def validate_graph_errors(nodes, *, admission=False):
+# ---------- #475: hold-vs-wall invariant — a hold longer than every lane is a trap ----------
+# pstack-autopilot-stack receipt (2026-10-19): an owners lane with timeout 10800
+# serially shepherded sub-WOF runs whose human gates could hold 86400 — mid-collection
+# lane death, discovered only at the wall. The collision is graph-statically decidable:
+# a `hold_timeout` is the ceiling of a gate's hold window, and every lane in the graph
+# has a statically resolvable wall (node timeout > shape preset > graph defaults >
+# DEFAULT_SHAPE preset — the SAME precedence apply_graph_defaults bakes). If a gate
+# that HAS consumers can hold longer than the graph's MAX lane wall, no consumer lane
+# the graph itself can build outlives the hold: the admission REFUSES (R10 — new
+# surfaces only; runner/respawn re-validation of persisted graphs passes
+# admission=False and is never stranded). Where the graph survives the max-wall law
+# but one specific after-consumer's own wall sits under the hold, the door WARNS
+# (save/validate/run), naming both numbers. Graphs with no after-consumer of the
+# gate are silent — a terminal hold blocks nothing. Undecidable walls (non-numeric
+# keys — already defects; invisible graph defaults on a bare node list) resolve to
+# None, and a None skips its half of the law: the check must never refuse on a
+# GUESSED wall.
+
+def _lane_wall_seconds(node, defaults):
+    """The node's statically decidable lane wall in seconds, or None. Spawned kinds
+    only; precedence mirrors apply_graph_defaults: explicit node timeout > named
+    shape preset > graph defaults.timeout > DEFAULT_SHAPE preset. A present
+    non-numeric timeout is a defect the validator names elsewhere — never a wall."""
+    if not isinstance(node, dict) or kind(node).spawns is not True:
+        return None
+    t = node.get("timeout")
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0:
+        return t
+    shape = node.get("shape")
+    if shape is not None:
+        preset = SHAPE_PRESETS.get(shape)
+        if not isinstance(preset, dict):
+            return None  # invalid shape name: the validator owns the defect
+        v = preset.get("timeout")
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+    if isinstance(defaults, dict):
+        d = defaults.get("timeout")
+        if isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0:
+            return d
+    v = SHAPE_PRESETS.get(DEFAULT_SHAPE, {}).get("timeout")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+
+
+def _decidable_hold(node):
+    """A gate's decidable hold window (seconds), or None for a non-gate, an absent
+    or non-numeric hold_timeout (the per-node validator names that defect)."""
+    if not isinstance(node, dict) or node.get("type") != "gate":
+        return None
+    h = node.get("hold_timeout")
+    return h if isinstance(h, (int, float)) and not isinstance(h, bool) and h > 0 else None
+
+
+def _after_consumers(nodes, gate_id):
+    """Transitive `after` descendants of gate_id (cycle-safe walk)."""
+    children = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("id")
+        if not isinstance(nid, str):
+            continue
+        for dep in (n.get("after") or []):
+            if dep == nid:
+                continue
+            if isinstance(dep, str):
+                children.setdefault(dep, []).append(nid)
+    out, queue, seen = set(), [gate_id], {gate_id}
+    byid = {n.get("id"): n for n in nodes if isinstance(n, dict) and isinstance(n.get("id"), str)}
+    while queue:
+        for c in children.get(queue.pop(), []):
+            if c in seen:
+                continue
+            seen.add(c)
+            out.add(c)
+            queue.append(c)
+    return out, byid
+
+
+def wall_invariant_errors(nodes, defaults=None):
+    """[{node, field, msg}] — the #475 admission law, ONE row per offending gate.
+    `nodes` is the (already id-validated) node list; `defaults` is the graph's
+    defaults block when the caller can see it (graph-dict callers); None means the
+    resolver must not consult it and skips to the preset floor."""
+    errs = []
+    nodes = [n for n in (nodes or []) if isinstance(n, dict)]
+    walls = {}
+    for n in nodes:
+        gid = n.get("id")
+        if not isinstance(gid, str):
+            continue
+        w = _lane_wall_seconds(n, defaults)
+        if w is not None:
+            walls[gid] = w
+    for n in nodes:
+        gid = n.get("id")
+        hold = _decidable_hold(n)
+        if hold is None or not isinstance(gid, str):
+            continue
+        consumers, byid = _after_consumers(nodes, gid)
+        cwalls = [walls[c] for c in consumers if c in walls]
+        max_wall = max(walls.values()) if walls else None
+        if cwalls and max_wall is not None and hold > max_wall:
+            errs.append({"node": gid, "field": "hold_timeout",
+                         "msg": f"hold_timeout {hold} exceeds the enclosing graph's max lane wall "
+                                f"{max_wall}s — every consumer lane of this gate dies at its wall "
+                                f"before the hold can release (#475); raise the consumer timeout(s) "
+                                f"to >= {hold} or lower hold_timeout"})
+    return errs
+
+
+def wall_invariant_warnings(graph):
+    """[{node, field, msg}] — the #475 door advisory, one row per (gate, after-consumer)
+    pair whose own wall sits under the gate's hold while the graph passes the max-wall
+    law. Pure over the raw (unfilled) graph; NON-FATAL by law: the save lands, the
+    launch proceeds, the row names both numbers. Gates the admission REFUSES are
+    omitted here — the error owns that surface, never both."""
+    rows = []
+    if not isinstance(graph, dict):
+        return rows
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        return rows
+    defaults = graph.get("defaults") if isinstance(graph.get("defaults"), dict) else None
+    walls = {}
+    for n in nodes:
+        if isinstance(n, dict) and isinstance(n.get("id"), str):
+            w = _lane_wall_seconds(n, defaults)
+            if w is not None:
+                walls[n["id"]] = w
+    max_wall = max(walls.values()) if walls else None
+    for n in nodes:
+        gid = n.get("id") if isinstance(n, dict) else None
+        hold = _decidable_hold(n)
+        if hold is None or not isinstance(gid, str):
+            continue
+        consumers, byid = _after_consumers(nodes, gid)
+        cwalls = [(c, walls[c]) for c in consumers if c in walls]
+        if cwalls and max_wall is not None and hold > max_wall:
+            continue  # the admission error covers this gate; one voice per defect
+        for c, w in sorted(cwalls):
+            if w < hold:
+                rows.append({"node": gid, "field": "hold_timeout",
+                             "msg": f"gate {gid!r} can hold {hold}s past after-consumer "
+                                    f"{c!r} lane wall {w}s — the shepherd lane dies mid-collection "
+                                    f"at the wall (#475); raise {c}'s timeout or lower the hold"})
+    return rows
+
+
+def validate_graph_errors(nodes, *, admission=False, defaults=None):
     """Return a LIST of {node, field, msg} — EVERY defect, not the first. Strict ids:
     node ids double as filenames.
     #32: accepts a whole graph object too — `{grammar?, nodes:[...]}` — in which case
@@ -1350,9 +1498,13 @@ def validate_graph_errors(nodes, *, admission=False):
     validate_graph_full). Persisted graphs re-validated at gate release or runner
     restart pass the default False and are never stranded by them (PR #280 R10)."""
     errs = []
+    _wl_defaults = None  # #475: the wall resolver may consult graph defaults ONLY when visible
     if isinstance(nodes, dict):
         errs.extend(grammar_errors(nodes))
+        _wl_defaults = nodes.get("defaults")
         nodes = nodes.get("nodes")
+    if isinstance(defaults, dict):   # explicit graph-view passthrough (door callers)
+        _wl_defaults = defaults
     def E(nid, field, msg):
         errs.append({"node": nid, "field": field, "msg": msg})
 
@@ -2069,6 +2221,14 @@ def validate_graph_errors(nodes, *, admission=False):
                     E(nid, "consolidate.from", f"fan-out {_f!r} already has consolidate "
                                                f"partner {_fan_seen[_f]!r}; one partner per wave")
                 _fan_seen[_f] = nid
+    if admission:
+        # #475: the hold-vs-wall admission law rides this SAME admission-only block
+        # (R10: runner load and respawn re-validation pass admission=False and are
+        # never stranded by new rules — persisted runs finish under their admitted
+        # bytes). Defaults are consulted only on a graph-dict view (the door's
+        # `defaults=` passthrough or dict input); a bare node list resolves walls
+        # from node-level truth alone, never a guessed floor.
+        errs.extend(wall_invariant_errors(nodes, _wl_defaults))
     return errs
 
 def validate_graph(nodes):
@@ -2832,7 +2992,8 @@ def validate_graph_full(graph):
                              "field": "after", "msg": "after must be a list of node id strings"})
                 item["after"] = []
             safe.append(item)
-    errs.extend(validate_graph_errors(safe, admission=True))
+    errs.extend(validate_graph_errors(safe, admission=True,
+                                      defaults=graph.get("defaults")))
     return errs
 
 # ---------- include-by-expansion (design 2026-09-30) ----------

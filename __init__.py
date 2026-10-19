@@ -213,7 +213,10 @@ def _validation_error(graph, run_dir=None):
                              "field": "after", "msg": "after must be a list of node id strings"})
                 item["after"] = []
             safe.append(item)
-    errs.extend(validate_graph_errors(safe, admission=True))  # R10: submit door only
+    errs.extend(validate_graph_errors(safe, admission=True,   # R10: submit door only
+                                      # #475: the wall resolver may see the graph's own
+                                      # defaults — the door holds the graph dict.
+                                      defaults=graph.get("defaults") if isinstance(graph, dict) else None))
     # #85: the artifact-admission guard composes with the validator here, so EVERY
     # door admission path (run/amend/submit/save/validate) measures ledgers before
     # any write/spawn. Artifact BYTES are measured only when a run dir exists to
@@ -2249,6 +2252,10 @@ def act_save(args):
     # est-fanout-cell: the same non-fatal law — a shelved graph that
     # fans out without a consolidate partner gets ONE named warning.
     _warn.extend(_fanout_cell_warnings(graph))
+    # #475: the hold-vs-wall advisory rides the SAME non-fatal save channel —
+    # a shelved graph whose gate can hold past an after-consumer's wall names
+    # both numbers at SAVE time, before the trap is ever launched.
+    _warn.extend(_common.wall_invariant_warnings(graph))
     # est-kg3y s12: only an ENVELOPE entry declares a contract (meta is where
     # params live), so only it can disagree with its refs. A bare entry's
     # contract is wholly derived from refs — a bound bare save stays warning-free
@@ -2499,6 +2506,12 @@ def act_validate(args):
                              "msg": f"max_turns {cap} is below shape {shape!r} p95 "
                                     f"budget {budget}; leave max_turns unset to use "
                                     "the preset, or keep a measured explicit cap"})
+    # #475: the hold-vs-wall advisory rides the SAME warnings channel (union law
+    # #421): dict rows like the p95 advisory, emitted AFTER _validation_error, so
+    # a gate the admission REFUSES reports once as the error, never twice. The
+    # graph is defaults-filled at this line; the resolver reads an explicit
+    # (baked) timeout first, so filled bytes resolve the SAME walls.
+    warnings.extend(_common.wall_invariant_warnings(graph))
     if warnings:
         out["warnings"] = warnings
     return out
@@ -3313,7 +3326,7 @@ def act_run(args):
                        + _liveness_hint_suffix(_liveness_notes)}
         if _include_notes:
             out["include_notes"] = _include_notes
-        warnings = _node_id_warnings(graph)
+        warnings = _node_id_warnings(graph) + _common.wall_invariant_warnings(graph)  # #475
         if warnings:
             out["run_warnings"] = warnings
         return out
@@ -3554,7 +3567,7 @@ def _create_run(args, graph, lib_name, models, routes, _liveness_notes, lane_pat
             "card": _card(rid), "lifecycle_notice": _lifecycle_notice(rid)}
     if include_notes:
         out["include_notes"] = include_notes   # scratch-collision warnings ride the launch
-    warnings = _node_id_warnings(graph)
+    warnings = _node_id_warnings(graph) + _common.wall_invariant_warnings(graph)  # #475
     if warnings:
         out["run_warnings"] = warnings
     return out
