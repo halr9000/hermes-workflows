@@ -454,8 +454,14 @@ node --check desktop/plugin.js                    # desktop half parses
 node --experimental-strip-types tests/test_edge_routing.mjs
 python3 scripts/suite.py . ci-out                 # full serial suite → ci-out/exits.json (merge gate)
 hermes plugins validate .                         # manifest + SDK-surface + security scan
+python3 wf.py validate [--json] <graph.json>      # lint a GRAPH FILE through the SAME door pipeline
 python3 scripts/make_public.py /tmp/public-tree   # private-string audit; must print "0 scrub hits"
 ```
+
+`wf.py validate` is argv for `action=validate` (#474): the same defaults fill, defect
+collection, model/route policy and warnings channel, with no run dir, no liveness ping
+and no writes — exit 0 on `ok:true`, 1 on a red verdict (the `errors[]` rows print),
+2 on a usage/IO fault. It needs no `--plugin-dir`: `wf.py` binds its own siblings.
 
 A change is done when: its targeted test is green, the full suite is green, validate
 prints `Validation passed.`, and the scrub audit prints `0 scrub hits`. CI runs the

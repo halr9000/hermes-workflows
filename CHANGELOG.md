@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- feat(cli): `wf.py validate [--json] <graph.json>` — the documented graph-lint
+  entrypoint now exists on argv (issue #474: three fix crews reached for it and found
+  no subcommand, falling back to importing `act_validate` or the tool). It is argv for
+  `action=validate`, NOT a second validator: the runner spec-loads the sibling door and
+  calls `act_validate` verbatim, so defaults fill, defect collection, model/route policy
+  and the advisory warnings channel are the same code path, byte-for-byte (pinned by
+  deep-equality in `tests/test_validate_argv_474.py`). No run dir, no liveness ping, no
+  writes. Exit 0 on `ok:true`, 1 on a red verdict (the `errors[]` rows print), 2 on a
+  usage/IO fault — a CI lane can gate on the number alone. No `--plugin-dir` flag: the
+  runner already binds its own siblings by path.
 - docs(v1.4.0): revitalization pass — README drift fixes (`/wf <name>` returns
   a run instruction, `/wf gates` behind `admission_gates`, `library name:` /
   `amend patch` forms documented), four spec-backed showcase diagrams under

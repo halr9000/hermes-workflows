@@ -81,7 +81,7 @@ One tool, action-routed — the complete surface, with the flags that matter:
 | `save` | Shelve a graph in the library under a name (overwrite = current best): `description`, `tags` (1–10, flat or `facet:value`; reuse `library`'s `tag_vocab` verbatim), optional `source` attribution writes provenance (owner, digest, timestamp) — attribution, never access control. |
 | `submit` | Quarantine a hand-rolled graph the library didn't cover for human-gated study — requires a `why_not_library` receipt (≥80 chars); never joins the library. |
 | `library` | List shelved graphs richly (nodes, gates, fan-outs, description, tags, provenance), filterable by ALL-match tags; an empty filtered result says which tag starved. `name:"<name>"` returns required inputs and an instantiate command. |
-| `validate` | Dry-run the door's validation pipeline (defaults fill, defect collection, model/route policy) with no ping and no writes — `{ok, errors:[{node,field,msg}], resolved_routes}`. |
+| `validate` | Dry-run the door's validation pipeline (defaults fill, defect collection, model/route policy) with no ping and no writes — `{ok, errors:[{node,field,msg}], resolved_routes}`. Same pipeline on argv, for heads that have no tool in reach (CI, pre-commit, plain shells): `python3 wf.py validate [--json] <graph.json>` — exit 0 ok, 1 red (the `errors[]` rows print), 2 usage/IO fault. No `--plugin-dir`: `wf.py` binds its own siblings. |
 | `doctor_version` | Read-only version truth for THIS install: `{live_version, newest_packaged, source_commit, drift}` — plugin.yaml vs the `install.json` provenance `pack.py` stamps at build time; one read, no network. |
 
 Plus a `/wf` slash command: bare `/wf` lists the library; `/wf <name> [note]`

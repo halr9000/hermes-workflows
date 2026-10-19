@@ -9390,6 +9390,90 @@ def finalize(run, graph, status):
     emit(f"WORKFLOW_{status.upper()} {run.name}")
     notify(run, f"run.{status}", graph={"nodes": nodes})
 
+
+# ---------- CLI: validate (issue #474) ----------
+
+_DOOR_MOD_NAME = "_hermes_workflows_door_cli"   # private bind, same law as _COMMON_PATH above
+
+
+def _cli_validate(argv):
+    """`wf.py validate [--json] <graph.json>` — the door's validate pipeline on argv.
+
+    NOT a second validator. This spec-loads the sibling door module (`__init__.py`,
+    privately under `_DOOR_MOD_NAME` — no sys.path mutation, no generic name in
+    sys.modules) and calls its `act_validate` verbatim, so the defaults fill, defect
+    collection, model/route policy and the advisory warnings channel are the SAME code
+    path `workflow {action: "validate"}` walks: one pipeline, one verdict. Nothing
+    pings, nothing is written, no run dir, nothing spawns.
+
+    Exit codes: 0 = ok:true; 1 = red verdict (the errors[] envelope is printed);
+    2 = usage/IO fault — the file was never readable enough for the door to judge,
+    so there is no verdict to report.
+    """
+    as_json = False
+    paths = []
+    for a in argv[2:]:
+        if a == "--json":
+            as_json = True
+        elif a.startswith("-"):
+            print(f"validate: unknown flag {a!r} "
+                  "(usage: wf.py validate [--json] <graph.json>)")
+            return 2
+        else:
+            paths.append(a)
+    if len(paths) != 1:
+        print("usage: wf.py validate [--json] <graph.json>")
+        return 2
+    _p = Path(paths[0]).expanduser()
+    try:
+        graph_path = (_p if _p.is_absolute() else Path.cwd() / _p).resolve()
+    except OSError:
+        graph_path = _p
+    if not graph_path.is_file():
+        print(f"validate: not a readable file: {paths[0]}")
+        return 2
+    _spec = importlib.util.spec_from_file_location(
+        _DOOR_MOD_NAME, Path(__file__).resolve().parent / "__init__.py")
+    if _spec is None or _spec.loader is None:
+        print("validate: no door module beside this runner (install the plugin dir, "
+              "not a lone wf.py copy)")
+        return 2
+    door = importlib.util.module_from_spec(_spec)
+    try:
+        _spec.loader.exec_module(door)
+        res = door.act_validate({"graph_path": str(graph_path)})
+    except Exception as e:   # the door itself faulted: no verdict, never a false green
+        print(f"validate: door pipeline did not run: {type(e).__name__}: {e}")
+        return 2
+    if not isinstance(res, dict) or "ok" not in res:
+        print("validate: " + (res.get("error") if isinstance(res, dict) and res.get("error")
+                              else f"door returned no verdict: {res!r}"))
+        return 2
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
+    elif res.get("ok"):
+        print(f"VALID ok {graph_path.name} — {res.get('hint') or 'validated only'}")
+        _routes = res.get("resolved_routes") or {}
+        for _nid, _pair in (sorted(_routes.items()) if isinstance(_routes, dict) else []):
+            _r = (_pair or {}).get("resolved") or {}
+            if _r.get("model"):
+                print(f"  {_nid} -> {_r.get('provider') or '?'}/{_r['model']}")
+    else:
+        print(f"VALID fail {graph_path.name}: {res.get('error') or 'graph invalid'}")
+        for e in res.get("errors") or []:
+            if isinstance(e, dict):
+                where = f"node {e['node']}" if e.get("node") else "graph"
+                print(f"  {where}: {e.get('field')}: {e.get('msg')}")
+            else:
+                print(f"  graph: {e}")
+    for w in res.get("warnings") or []:   # mixed rows: s12 strings, p95 dicts (#256/#421)
+        if isinstance(w, dict):
+            print(f"  warn node {w.get('node')}: {w.get('field')}: {w.get('msg')}")
+        else:
+            print(f"  warn {w}")
+    return 0 if res.get("ok") else 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 7 and sys.argv[1] == "register-job":
         r = find_run(sys.argv[2])
@@ -9421,8 +9505,14 @@ if __name__ == "__main__":
             sys.exit(0)
         print(f"REFUSED {_rl_run.name} ({_rl.get('reason')})")
         sys.exit(1)
+    # #474: the graph-lint entrypoint for heads with no `workflow` tool in reach
+    # (CI, pre-commit, plain shells). Same door pipeline as action=validate — see
+    # _cli_validate for the one-pipeline law and the exit-code contract.
+    if len(sys.argv) >= 3 and sys.argv[1] == "validate":
+        sys.exit(_cli_validate(sys.argv))
     if len(sys.argv) < 3 or sys.argv[1] != "run":
-        print("usage: wf.py run <run_id> | wf.py release-lock <run_id>"); sys.exit(2)
+        print("usage: wf.py run <run_id> | wf.py validate [--json] <graph.json> "
+              "| wf.py release-lock <run_id>"); sys.exit(2)
     # 5c37b19 guard 2 (belt-and-braces): a runner whose cwd was deleted mid-life dies
     # on the FIRST relative-path/cwd-touching call. HERE is durable — the same dir
     # __init__.py pins as the spawn cwd — so recover there before main() can raise.
