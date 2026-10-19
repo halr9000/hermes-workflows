@@ -1,7 +1,7 @@
 ---
 name: workflow
 description: "Workflow fan-out audit and census: run agent graphs"
-version: 1.3.9
+version: 1.4.0
 metadata:
   hermes:
     tags: [workflows, fan-out, audit, census, orchestration]

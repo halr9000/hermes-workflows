@@ -1,6 +1,6 @@
 # Graph grammar and authoring boundaries
 
-Workflow 1.3.9. Minimal form: `workflow{action:"run", graph:{"name":"check","nodes":[{"id":"a","type":"agent","goal":"Return a fenced JSON object with key ok=true"}]}}`. The run action's `name` overrides `graph.name`; otherwise the graph name is used, then `workflow`.
+Workflow 1.4.0. Minimal form: `workflow{action:"run", graph:{"name":"check","nodes":[{"id":"a","type":"agent","goal":"Return a fenced JSON object with key ok=true"}]}}`. The run action's `name` overrides `graph.name`; otherwise the graph name is used, then `workflow`.
 
 ## Per-run concurrency (optional)
 
