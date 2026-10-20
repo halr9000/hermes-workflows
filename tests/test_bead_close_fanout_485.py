@@ -284,15 +284,29 @@ class BeadCloseFanout(unittest.TestCase):
         self.assertEqual(rec.get("status"), "done", f"string-item roster refused: {rec}")
         self.assertEqual([p["id"] for p in rec["bead_close_receipts"]], ["est-s1", "est-s2"])
 
-    # ---- (i) doc pins: the grammar line carries the per-item law and the
-    #         gate source keys on the shared read-back core.
+    # ---- (i) doc pins on the PUBLIC vocabulary + one behavior pin (est-luk28:
+    #         this test used to grep wf.py for internal def names — rename-
+    #         fragile text that breaks on a refactor which changes no behavior.
+    #         The contract lives in the documented keys, not the defs; per-item
+    #         rows and the plural enumeration are behavior-pinned in (a)/(f)).
     def test_i_doc_pins(self):
         gram = (ROOT / "references" / "grammar.md").read_text(encoding="utf-8")
         self.assertIn("bead_close_receipts", gram,
                       "grammar.md must document the per-item plural enumeration")
         src = (ROOT / "wf.py").read_text(encoding="utf-8")
-        self.assertIn("def _bead_close_readback", src)
-        self.assertIn("def _bead_close_gate_items", src)
+        self.assertIn("bead_close_receipts", src,
+                      "the shipped gate must still mint the fan-out plural key")
+        # behavior pin behind the text pins: the node-scoped (echo) path mints
+        # the SINGULAR key with the closed row shape — rename-resilient proof
+        # the read-back core is shared, not text.
+        self.set_store(**{"est-i0": {"status": "closed", "assignee": "hermes"}})
+        r = self.mk("solo-i", [{"id": "solo", "type": "echo", "output": {"r": 1},
+                                "bead_close": {"store": str(self.home / "estate"),
+                                               "id": "est-i0", "actor": "hermes"}}])
+        self.assertIn("WORKFLOW_DONE", self.wf("solo-i"))
+        row = self.rec(r, "solo").get("bead_close_receipt")
+        self.assertIsInstance(row, dict, "echo path minted no singular receipt")
+        self.assertEqual(set(row or {}), ROW_KEYS, "echo receipt keeps the closed row shape")
 
 
 if __name__ == "__main__":
