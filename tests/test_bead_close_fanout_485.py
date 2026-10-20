@@ -29,9 +29,16 @@ The contract implemented (issue #485):
     error_class "bead_close", naming each offender; a template rendering to
     empty, whitespace, or surviving braces fails THAT item typed and is never
     probed (the argv law is checked after interpolation, never assumed);
-  * a fan-out node with a LITERAL (token-free) declaration keeps the old
-    node-scoped single-probe shape byte-identical — no item rows touched, no
-    plural key minted; no declaration at all stays scan-free.
+  * a fan-out node with a LITERAL (token-free) declaration keeps the node-scoped
+    single-probe shape (no item rows touched, no plural key minted, one probe);
+    the honest escape is PER ITEM there too (est-nbe2y fold): the whole-blob
+    `close-pending` search let one lane's token — or the phrase in any
+    non-committing row — exempt the aggregate from read-back while sibling
+    committing lanes served the claim, the 13z1 false-green shape at fan-out
+    scale; after the fold any committing (done/partial) item without its own
+    pending token forces the probe, and only an all-pending aggregate commits
+    pristine with zero probes;
+  * no declaration at all stays scan-free.
 
 RED proof (run before the fix): (a) the gate probes the literal "{bead}" once
 and the run dies with bead_close_unproven over an unresolved brace token;
@@ -103,7 +110,10 @@ class BeadCloseFanout(unittest.TestCase):
         p = r / "nodes" / f"{nid}.json"
         return json.loads(p.read_text()) if p.exists() else {}
 
-    def lanes(self, items, decl, goal='CLOSE-CLAIM {"result":"done","note":"{bead} closed"} post verdict'):
+    def lanes(self, items, decl, goal='CLOSE-CLAIM {"result":"done","note":"{bead} closed"} post verdict',
+              notes=None):
+        if notes is not None:      # est-nbe2y: per-item close-pending control
+            items = [dict(it, close_note=notes[i]) for i, it in enumerate(items)]
         return {"id": "lanes", "type": "agent",
                 "fanout": {"items": items, "goal": goal},
                 "bead_close": decl}
@@ -330,6 +340,59 @@ class BeadCloseFanout(unittest.TestCase):
         src = (ROOT / "wf.py").read_text(encoding="utf-8")
         self.assertIn("def _bead_close_readback", src)
         self.assertIn("def _bead_close_gate_items", src)
+
+    # ---- (j) est-nbe2y fold: the per-item escape on a TOKEN-FREE fan-out
+    #         decl. Lane 1 honestly returns close-pending; lane 2 claims the
+    #         shared literal bead closed and the store says otherwise. The
+    #         pre-fold whole-blob search saw lane 1's token and skipped the
+    #         probe entirely — the aggregate committed DONE over an unproven
+    #         claim with ZERO probes on the wire (RED proof: run this against
+    #         the pre-fold gate and it commits done with no receipt). After
+    #         the fold the committing lane forces the node-scoped read-back
+    #         and the demote names the pending lanes that never excused it.
+    def test_j_pending_lane_does_not_exempt_literal_decl(self):
+        self.set_store(**{"est-static": {"status": "in_progress", "assignee": "other-seat"}})
+        r = self.mk("fo-j", [self.lanes(
+            [{"bead": "est-static", "who": "hermes"},
+             {"bead": "est-static", "who": "hermes"}],
+            self.decl(id="est-static", actor="hermes"),
+            goal=('CLOSE-CLAIM {"result":"done","note":"{close_note}"} post verdict'),
+            notes=["close-pending: assignee guard is not my seat",
+                   "est-static closed"] )])
+        out = self.wf("fo-j")
+        self.assertNotIn("WORKFLOW_DONE", out)
+        rec = self.rec(r, "lanes")
+        self.assertEqual(rec.get("status"), "failed",
+                         f"pending straggler still exempts a committing sibling: {rec}")
+        self.assertEqual(rec.get("error_class"), "bead_close")
+        self.assertIn("bead_close_unproven: est-static", rec.get("error", ""))
+        self.assertIn("close-pending lane(s) never excuse", rec.get("error", ""))
+        self.assertTrue(rec.get("bead_close_receipt"),
+                        "the demoted record carries the measured singular row")
+        self.assertFalse(rec["bead_close_receipt"]["ok"])
+        self.assertNotIn("run.done", (r / "events.jsonl").read_text())
+        shows = [a for a in self.argvs() if "show est-static" in a]
+        self.assertEqual(len(shows), 1, "node-scoped single probe kept — exactly one")
+
+    # ---- (k) est-nbe2y fold, the keep side: an ALL-pending token-free
+    #         aggregate is still a whole-node non-claim — pristine record,
+    #         zero probes, node commits (honesty is never punished).
+    def test_k_all_pending_literal_aggregate_stays_pristine(self):
+        self.set_store(**{"est-static": {"status": "in_progress", "assignee": "other-seat"}})
+        r = self.mk("fo-k", [self.lanes(
+            [{"bead": "est-static", "who": "hermes"},
+             {"bead": "est-static", "who": "hermes"}],
+            self.decl(id="est-static", actor="hermes"),
+            goal=('CLOSE-CLAIM {"result":"done","note":"{close_note}"} post verdict'),
+            notes=["close-pending: first guard", "close-pending: second guard"])])
+        out = self.wf("fo-k")
+        self.assertIn("WORKFLOW_DONE", out)
+        rec = self.rec(r, "lanes")
+        self.assertEqual(rec.get("status"), "done", f"all-pending aggregate broke: {rec}")
+        self.assertNotIn("bead_close_receipt", rec, "non-claim: record stays pristine")
+        self.assertNotIn("bead_close_receipts", rec)
+        self.assertEqual([a for a in self.argvs() if "show est-static" in a], [],
+                         "no claim, no read")
 
 
 if __name__ == "__main__":

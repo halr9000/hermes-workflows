@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- chore(bead_close): per-item `close-pending` escape folded into TOKEN-FREE
+  fan-out decls (est-nbe2y, pre-existing from est-13z1; found reviewing #486).
+  The node-scoped whole-blob search let ONE lane's honest `close-pending` —
+  or the phrase appearing in any non-committing row — exempt the whole
+  aggregate from store read-back while sibling done/partial lanes served the
+  very claim the gate exists to verify: the 13z1 false-green shape at fan-out
+  scale. The escape is now per item: any committing item without its own
+  pending token forces the (still single, node-scoped) probe, and only an
+  ALL-pending aggregate commits pristine with zero probes. The single-probe
+  shape is kept (singular receipt key, item rows untouched, one probe) —
+  `test_f` stands; pins in `tests/test_bead_close_fanout_485.py` (j, k) and
+  `references/grammar.md` (bead_close).
+
 - fix(contract): between-turns wake is the delivery DEFAULT; the wait loop was
   demoted to what it always mechanically was — optional blocking observation and
   the revive verb. Operator-facing truth audit (host ledger, ~40 runs): the

@@ -1622,27 +1622,52 @@ def _bead_close_gate(run, node, rec):
     # closed-without-claim still PASSes from the read-back; the check anchors
     # to the store, never to the prose).
     out = rec.get("output")
-    if _bc_decl_interpolated(decl) and isinstance(out, dict) \
-            and isinstance(out.get("all_results"), list):
+    _aggregate = isinstance(out, dict) and isinstance(out.get("all_results"), list)
+    if _aggregate and _bc_decl_interpolated(decl):
         # #485 fan-out: the pending law is PER ITEM (one lane's honest
         # close-pending never excuses the aggregate from reading back the
         # beads the OTHER items claimed closed), so this branch runs ahead of
         # the node-scoped non-claim check.
         return _bead_close_gate_items(decl, rec)
-    if _declares_close_pending(rec.get("output")):
-        return rec                        # honest non-claim: no read, record pristine
+    _fo_pending = 0
+    _committing = []
+    if _aggregate:
+        # est-nbe2y fold: a TOKEN-FREE fan-out decl keeps the node-scoped
+        # single-probe shape, but the honest escape is PER ITEM too — the
+        # whole-blob search let ONE lane's `close-pending` (or the token
+        # appearing in any non-committing row) exempt the whole aggregate
+        # from read-back while sibling done/partial lanes served the very
+        # claim the gate exists to verify: the 13z1 false-green shape at
+        # fan-out scale. A committing (done/partial) item WITHOUT its own
+        # pending token is a claim on the declared id and forces the probe;
+        # only an all-pending aggregate commits pristine with zero probes.
+        _committing = []
+        for r in out["all_results"]:
+            if isinstance(r, dict) and r.get("status") in ("done", "partial"):
+                if _declares_close_pending(r.get("output")):
+                    _fo_pending += 1
+                else:
+                    _committing.append(r)
+        if not _committing:
+            return rec            # all lanes honestly pending: no claim, no read
+    elif _declares_close_pending(rec.get("output")):
+        return rec                # honest non-claim: no read, record pristine
     bid = str(decl.get("id", "")).strip()
     store = str(decl.get("store", "")).strip()
     row, reason = _bead_close_readback(store, bid, decl.get("actor"))
     rec = dict(rec, bead_close_receipt=row)
     if not row["ok"]:
+        _fo_note = (f" — {_fo_pending} close-pending lane(s) never excuse the "
+                    f"{len(_committing)} committing lane(s) that served {bid}; "
+                    "the escape is per item (est-nbe2y)."
+                    if _aggregate and _fo_pending else "")
         rec = {"status": "failed",
                "error": f"bead_close_unproven: {bid}: {reason} — the node's output "
                         "claims the bead was closed; the runner read the estate "
                         "store itself and it is not closed (assignee "
                         f"{row['assignee']!r}). Close it with --actor matching the "
                         "assignee, or return 'close-pending: <reason>' and never "
-                        "claim closure.",
+                        f"claim closure.{_fo_note}",
                "error_class": "bead_close",
                "bead_close_receipt": row,
                "output": rec.get("output"), "ms": rec.get("ms")}
