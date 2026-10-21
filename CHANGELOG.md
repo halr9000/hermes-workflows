@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- fix(quota): the #24 cost gate matches by ROUTE, not by raw model name (#499). A
+  subscription is a route, not a name, and both seams of the quota cache ignored the
+  provider half of it. FALSE REFUSAL: `_quota_note()` stamped a provider-pinned death
+  under the bare model name and `_quota_refusal()` matched that bare name too, so one
+  `fatal_quota` death on `provider-A/x` refused at admission ANY node pinning
+  `provider-B/x` — a live route billed on a different subscription — and the refusal
+  killed the whole submit (`route_unavailable at submit`), exactly the resubmit-churn
+  class #296 removed from the forbidden-model gate. FALSE ADMIT, vice versa: a stamp
+  carrying the provider-qualified spelling of an Anthropic route did not bind a node
+  pinning the folded spelling core actually bills, so the gate missed its own mark
+  one punctuation apart. Both seams now obey the ONE
+  route-identity contract (est-2ek.1.699, `route_ids_equal`) that already governs the
+  forbidden-model gate, the submit ping law and the runner's commit hold:
+  `wfcommon.quota_stamp` writes the mark — the qualified `provider/model` key whenever
+  the dead node named a provider (a coherent `route_verified` receipt names the route
+  that died; a contradicting one claims only the node's own pin), with `provider` in
+  the record — and `wfcommon.quota_stamp_binds` reads it: a provider-qualified mark
+  binds its route by identity, a provider-blank mark binds only a pin whose AUTHOR
+  named no subscription (a door-baked provider is derived, not claimed), and a
+  pre-#499 entry keeps exactly the binding it had, verbatim spelling. The cache key
+  set therefore gains an optional `provider/` prefix; readers are name-scoped
+  lookups, and the A1 frozen-skip, A5 recovery-ping and expiry laws are unchanged —
+  no relaxation for a mark that genuinely names the node's route. Tests:
+  `test_quota_route_identity_499` (both #499 repros, the stamp round-trip, and the
+  laws that must not relax); `test_fatal_quota_24`,
+  `test_literal_provider_prefix_46` (#291 F3) and `test_route_identity_699` stay green.
+
 - fix(engine): the status payload now carries the completeness truth as a
   derived field. `completed` (bool) rides every `status` read, derived in the
   same fold as `status` and `failed_nodes` — true only for a terminal

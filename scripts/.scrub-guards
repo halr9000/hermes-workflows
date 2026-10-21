@@ -21,6 +21,14 @@ regex:^- #[0-9]+ — (Hermes Agent; )?@jacobhausler\.$
 # guard covers ONLY the copyright line of LICENSE.
 regex:^Copyright \(c\) \d{4} (Jacob Hausler|jacobhausler)$
 
+# ---- #499 quota route-identity fixture (2026-10-21) ----
+# The spelling-fold pair must carry the `claude-` prefix: stock core folds '.'->'-'
+# ONLY for claude-prefixed Anthropic ids, so a neutral prefix would test nothing. The
+# model names are invented; anchored to the three fixture-assignment lines (not the
+# file), so a stray vendor model name anywhere else still fires. GUARD, same
+# fixture-identity class as tests/test_route_identity_699.py:54-57.
+regex:^(DOT|DOT_M|FOLD) = "(anthropic/)?claude-model-5
+
 # ---- Core-10 committed scrub list (2026-10-01): GUARD rows for the merged audit ----
 # Classification discipline per docs/PUBLISH-SCRUB.md: GUARD = load-bearing absence
 # -enforcing or fixture identity; kept verbatim. Everything below names the WHY.

@@ -308,8 +308,13 @@ publication guards, and crash recovery.
   never burned) and the error names the fix: the node's provider pin or the seat config.
   `fatal_quota` (#24): a 429 whose own text carries a reset horizon beyond the run's
   reach — fails on the FIRST attempt (the retry ladder cannot beat a multi-day reset)
-  and stamps the model into the seat quota cache; the door then refuses a launch on
-  that model until the horizon passes (one recovery ping first).
+  and stamps the ROUTE into the seat quota cache — `provider/model` whenever the dead
+  node named a provider, with `provider` in the record (#499). The door then refuses
+  a launch whose pin names that SAME subscription until the horizon passes (one
+  recovery ping first): a bare stamp marks the seat's own subscription only and never
+  refuses a pin the author claimed on another provider, while a qualified stamp binds
+  its own route by identity (`route_ids_equal`), so the Anthropic dotted and folded
+  spellings of one subscription are one mark.
   `lease_busy`: a child that exited rc=130 with the CLI's own fail-closed lease notice
   (`Stopped waiting for another Hermes process on this session. Your message was not
   processed.`) lost the session-lease race — another Hermes process held the session
