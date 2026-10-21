@@ -738,6 +738,8 @@ WORKFLOW_PARAMS = {
         "kind": {"type": "string", "enum": ["submissions"], "description": "inbox (optional): 'submissions' = list workflow submit study items newest-first (read-only; promotion is a human decision). Omit inside a child spawn to pull baked steering as before."},
         "team": {"type": "string", "description": "run (optional, <=64 chars): team label stamped into run.json and shown by list; no effect on scheduling."},
         "lane_key": {"type": "string", "description": "run (optional, <=128 chars): in-flight registry key — a second run with the same key while the incumbent is unfinished is deduped (no spawn; returns the incumbent's run_id); status lane_key=<key> reads the incumbent instead of run_id. Keys are global per runs root; prefix with <team>/ yourself."},
+        "concurrency": {"type": "integer", "description": "run (optional, positive integer): launch-time override for simultaneous agent nodes — the #100 graph-key law applied to a run ARG: shape-checked at submit, clamped to the owner's max_concurrency, baked into run.json under the existing key, outside def_hash/efp. Co-declared with the same-name graph key is refused before any write — one channel per key."},
+        "item_concurrency": {"type": "integer", "description": "run (optional, positive integer): launch-time override for simultaneous fan-out items — same law as `concurrency`, mirroring the #100 item channel (owner max_item_concurrency clamp)."},
         "owner": {"type": "string", "description": "save (optional, <=64 chars): provenance owner override; defaults to the launcher profile. Every save now stamps provenance {owner, version, source, saved_at, source_digest} (#126 default-on)."}, 
         "source": {"type": "string", "description": "save (optional, <=512 chars): where this graph came from (repo path, URL, skill, attribution line) — every save stamps provenance {owner, version, source, saved_at, source_digest} (#126 default-on; attribution, never access control)."},
         "graph_path": {"type": "string", "description": "run/save/amend/validate: absolute path to a caller-supplied local regular UTF-8 JSON graph file (max 1 MiB, no final symlink). Choose exactly one of graph, graph_path, or run's from / save's run_id. Validated before any write or spawn."},
@@ -3141,6 +3143,21 @@ def act_run(args):
     if bad:
         return bad
     assert graph is not None   # bad None <=> expansion succeeded (same law as `assert models`)
+    # #498: launch-time concurrency override ARGS on the run verb — the channel for a
+    # caller whose launch width is not the graph's authored width (library replay, a
+    # different seat budget, a fan-out that should run wider today). One channel per
+    # key (the params-vs-#126 law): an arg co-declared with the same-name graph key
+    # is REFUSED here, naming the key, before any write. A supplied arg joins the
+    # graph dict so the EXISTING graph-key law applies unchanged downstream:
+    # positive-int shape validation at submit, owner clamp + run.json bake at
+    # _concurrency_bake, def_hash/efp exclusion (fingerprint-ignored keys). Absent
+    # args touch nothing: run.json stays byte-identical (no-cap stability law).
+    for _ck in ("concurrency", "item_concurrency"):
+        if _ck in args:
+            if _ck in graph:
+                return {"error": f"run arg {_ck} co-declared with graph key {_ck}: "
+                                 "one channel per key — drop the graph key or the run arg"}
+            graph = dict(graph, **{_ck: args[_ck]})
     bad = _validation_error(graph) or _team_args_error(args)
     if bad:
         return bad

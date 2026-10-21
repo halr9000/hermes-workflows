@@ -14,6 +14,23 @@
   re-push replaces the stale pass instead of queueing a second one. Expected
   PR wall: ~7-9 min from ~31 at unchanged coverage.
 
+- feat(door): launch-time concurrency override ARGS on the run verb (#498).
+  `concurrency` / `item_concurrency` were graph keys only: a caller launching a
+  shelved entry at a different width, the same graph under a different seat
+  budget, or a wide fan-out that should launch wider than authored had no
+  legitimate channel — a run arg of that name was silently dropped, and a
+  co-declared graph key won without a word. The door now accepts both as
+  optional run args and feeds them the EXISTING graph-key law unchanged:
+  positive-int shape check at submit, clamp to the owner's
+  `max_concurrency`/`max_item_concurrency`, bake into `run.json` under the same
+  keys, exclusion from `def_hash`/`efp` — the runner reads the same meta and
+  changes zero. Co-declaration (arg + same-name graph key) is REFUSED before
+  any write naming the key — one channel per key, the params-vs-#126 law — and
+  silence is dead: requested width can no longer diverge from applied width
+  without an error. Absent args: `run.json` byte-identical (no-caps
+  stability). Tests: `tests/test_concurrency_run_args_498.py` (10 tests, incl.
+  `from=` replay and arg-channel/key-channel byte-parity).
+
 - fix(engine): the status payload now carries the completeness truth as a
   derived field. `completed` (bool) rides every `status` read, derived in the
   same fold as `status` and `failed_nodes` — true only for a terminal
