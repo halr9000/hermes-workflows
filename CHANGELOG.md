@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- fix(runner): the `on_skip:"pass"` done-commit on agent nodes now rides the
+  `_effect_gate` boundary (#56 law, est-0lxnh). The skip site committed
+  `done` with `{agent:"skipped"}` UNGATED, so an agent declaring `effects`
+  with a false `when` booked a zero-receipt done and the ledger ended
+  `run.done` over a postcondition that was never written — the fifth bypass
+  of the receipt law, PRE-EXISTING on main, found by adversarial probe P2
+  (replayed live at ac5c11ad: rc=0, status=done, `effect_receipts` absent).
+  The commit now runs through the same `_effect_gate` as the echo boundary:
+  unproven rows DEMOTE it to typed `failed` (`error_class:"effect_receipt"`,
+  `error: effect_receipt_unproven: ...`, measured rows ride the record,
+  never retried) and the run never reaches `run.done` over them. Honest
+  degradation holds: a node declaring no `effects` passes through untouched —
+  every existing `on_skip:"pass"` graph is byte-identical. Not folded into
+  #517 (the probe read it; the defect pre-dates it). New test:
+  tests/test_skip_pass_effects_0lxnh.py (red at base, green after).
+
 - feat(door): #509 — door UX on unknown-key refusals. Every `graph_invalid`
   refusal banner now names the door's own version (`[door X.Y.Z]`, plus the
   machine field `door_version`), a refused top-level key that belongs to a

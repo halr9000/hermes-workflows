@@ -9368,9 +9368,27 @@ def main(run_id):
                             error=f"{type(_we).__name__}: {_we}", when=n.get("when"))
                     if not _passed:
                         if str(n.get("on_skip", "prune")).lower() == "pass":
-                            save_node(run, n, rs.byid, {"status": "done",
-                                                       "output": {"agent": "skipped"},
-                                                       "ms": 0})
+                            # est-0lxnh (#56 law): the skip-pass done-commit is a
+                            # boundary commit and rides the receipt gate, exactly
+                            # like the echo edge above — a node declaring effects
+                            # can NEVER book done with zero measured rows, and a
+                            # false predicate guarantees the artifact was never
+                            # written. Unproven rows DEMOTE the commit to typed
+                            # failed (error_class effect_receipt, never retried).
+                            # Effects-free nodes pass through UNTOUCHED (the gate
+                            # is a no-op without `effects`): byte-identical for
+                            # every existing on_skip:pass graph.
+                            _srec = _effect_gate(run, n, {"status": "done",
+                                                         "output": {"agent": "skipped"},
+                                                         "ms": 0})
+                            save_node(run, n, rs.byid, _srec)
+                            if _srec["status"] != "done":
+                                log(run, "node.failed", node=n["id"],
+                                    error=_srec["error"],
+                                    error_class=_srec.get("error_class", "effect_receipt"),
+                                    attempts=0)
+                                states[n["id"]] = "failed"
+                                continue
                             log(run, "agent.skipped", node=n["id"], mode="pass")
                             states[n["id"]] = "done"
                             outputs[n["id"]] = {"agent": "skipped"}
