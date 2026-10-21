@@ -193,6 +193,90 @@ def route_provider(node, verified=None):
         return ""
     return vp or prov
 
+# ---------- #499: the quota stamp's SUBSCRIPTION identity ----------
+# The #24 seat quota cache is the submit-time cost gate, and a subscription is a
+# ROUTE, not a name: the stamp rides the provider-qualified id whenever the dead node
+# named a provider, and every later bind goes through the ONE route-identity contract
+# above. The raw-string seam got both directions wrong — a provider-blank stamp
+# refused a live route billed on a different subscription, and a qualified stamp
+# missed the folded spelling the runner itself normalizes. Two helpers, one law:
+# `quota_stamp` (write side, the runner) and `quota_stamp_binds` (read side, the door).
+
+def quota_stamp(node):
+    """(key, provider) for a #24 fatal_quota stamp from the runner's node dict: the
+    route the runner ACTUALLY drove — the door-baked `route_verified` receipt when it
+    is COHERENT (its provider agrees with the node's pin, or the node pinned none).
+    Qualified `provider/model` key when a provider is known (the mark names the
+    subscription that died); bare id for a seat-default death, which names no
+    subscription and must not pretend to. With no receipt — or one that contradicts
+    the pin — the mark claims only what the node itself claimed."""
+    node = node or {}
+    verified = str(node.get("route_verified") or "").strip()
+    own_p = str(node.get("provider") or "").strip().lower()
+    prov = route_provider(node, verified or None)
+    if verified and prov:
+        model = verified.partition("/")[2].strip()
+    else:
+        prov, model = own_p, str(node.get("model") or "").strip()
+    if not model:
+        prov, model = "", (own_p or "seat default")
+    return (f"{prov}/{model}" if prov else model), prov
+
+def quota_stamp_provider(key, entry=None):
+    """The provider a stamp names: the value's `provider` field (every post-#499
+    stamp writes one), else the key's leading '<provider>/' segment (the pre-bake
+    literal shape #291 F3 pins), else ''. An aggregator's vendor namespace cannot be
+    told apart from a provider by shape alone, so a stamp with neither claims
+    nothing — and a bare mark binds seat-default pins only."""
+    prov = str((entry or {}).get("provider") or "").strip().lower()
+    if prov:
+        return prov
+    k = str(key or "")
+    return k.partition("/")[0].strip().lower() if "/" in k else ""
+
+def quota_stamp_model(key, entry=None):
+    """The model id a stamp names: the key with its OWN provider prefix peeled when
+    the stamp qualifies itself with one (post-#499 keys are 'provider/model')."""
+    k = str(key or "")
+    prov = quota_stamp_provider(k, entry)
+    if prov and k.lower().startswith(prov + "/"):
+        return k[len(prov) + 1:]
+    return k
+
+def quota_stamp_binds(key, entry, model, provider=None, claimed=None):
+    """True when the quota stamp named by `key`/`entry` marks the SAME subscription
+    as a pin billed on route (`provider`, `model`) — the #499 law, both directions:
+      - a pin that bills on a provider binds only to a mark naming that provider, by
+        route IDENTITY (`route_ids_equal`), so the gate's own mark holds across the
+        Anthropic spelling fold — and never to a mark naming another provider's;
+      - a provider-blank (bare) mark names no subscription, so it binds only a pin
+        whose SUBSCRIPTION IS THE SEAT'S (`claimed` — the provider the AUTHOR named,
+        default: the billing provider; a door-baked provider is derived, not named) —
+        never a pin the author pinned to a specific provider;
+      - a PRE-#499 entry (no `provider` field) whose key prefix is not the pin's own
+        provider is ambiguous — an aggregator's vendor namespace is part of the id —
+        so it keeps exactly the binding it had: the pin's verbatim spelling.
+    Absence proves nothing: a blank model on either side never binds."""
+    k = str(key or "").strip().lower()
+    pv = str((entry or {}).get("provider") or "").strip().lower()
+    sp = quota_stamp_provider(k, entry)
+    pin_p = str(provider or "").strip().lower()
+    pin_c = str(claimed if claimed is not None else (provider or "")).strip().lower()
+    sm = quota_stamp_model(k, entry)
+    verbatim = k == str(model or "").strip().lower()
+    if not sp and not pv:
+        # provider-blank mark: names no subscription, so only a pin whose AUTHOR
+        # named none can be the subscription it marked (a door-baked provider on an
+        # alias pin is derived, not named — the seat still bills it)
+        return not pin_c and route_ids_equal(k, model, None)
+    if pin_p:
+        if sp == pin_p:
+            return route_ids_equal(sm, model, sp)
+        return (not pv) and verbatim         # legacy prefix: only the pin's own spelling
+    if pv:
+        return False                          # a named subscription, unnamed pin
+    return verbatim                           # legacy prefix on an unnamed pin
+
 def hermes_home():
     """Core's resolution when importable, else the raw env (1.0.15 semantics, unchanged).
 

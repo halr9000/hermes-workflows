@@ -1488,7 +1488,14 @@ def _quota_refusal(graph, routes=None, cache_path=None, skip=()):
     cache entry drops. A test-seated cache (WF_QUOTA_CACHE override) pings nothing.
     `skip` = node ids that replay-skip and never spawn (A1: the amend call passes
     the frozen set — a DONE node pinning a quota-marked model must not refuse the
-    whole amend when it will not re-run). Returns the error string or None."""
+    whole amend when it will not re-run). Returns the error string or None.
+
+    #499 (the subscription law): a mark binds a node only when it names the SAME
+    subscription — `wfcommon.quota_stamp_binds`. A provider-blank mark names no
+    subscription and binds seat-default pins only; a provider-qualified mark binds its
+    route by IDENTITY (Anthropic dotted == folded), never by raw spelling. Refusals
+    for same-subscription pins, the A1 frozen-skip law and both recovery-ping laws
+    stand untouched."""
     pth = _common.quota_cache_path(cache_path)
     try:
         cache = json.loads(pth.read_text()) if pth.exists() else {}
@@ -1506,18 +1513,28 @@ def _quota_refusal(graph, routes=None, cache_path=None, skip=()):
             continue                                        # A1: replay-skip, never spawns
         ent = (routes or {}).get(nid) or {}
         res = ent.get("resolved") or {}
-        names = {str(n.get("model")),
-                 *( [str(res.get("model"))] if res.get("model") else [] )}
-        # #291 F3: entries stamped under the full 'provider/model' id (the pre-bake
-        # literal) still bind the baked node {provider, model}.
-        req = (ent.get("requested") or {}).get("model")
+        # #499: the subscriptions this node could be billed on — its own pin, the
+        # door's resolved route, and the author's requested literal (#291 F3: an
+        # entry stamped under the pre-bake full 'provider/model' id still binds the
+        # baked node). Matching goes through wfcommon.quota_stamp_binds — route
+        # IDENTITY, never raw spelling: a bare mark cannot name an explicit-provider
+        # subscription, and a qualified mark binds its own route across the fold.
+        # WHO named the subscription is the AUTHOR's claim (`requested.provider`), not
+        # the provider the door baked on afterwards: an alias pin rides the seat.
+        req_ent = ent.get("requested") or {}
+        claimed = str((req_ent.get("provider") if ent and req_ent else n.get("provider")) or "")
+        pins = [(str(n.get("model")), n.get("provider"), claimed)]
+        if res.get("model"):
+            pins.append((str(res.get("model")),
+                         res.get("provider") or n.get("provider"), claimed))
+        req = req_ent.get("model")
         if req:
-            names.add(str(req))
-        if n.get("provider") and "/" not in str(n.get("model")):
-            names.add(f"{n['provider']}/{n['model']}")
-        for key in names:
-            hit = cache.get(key)
+            pins.append((str(req), n.get("provider"), claimed))
+        for key, hit in list(cache.items()):    # A5 recovery pops: snapshot the keys
             if not isinstance(hit, dict) or hit.get("resets_epoch", 0) <= _t.time():
+                continue
+            if not any(_common.quota_stamp_binds(key, hit, m, p, claimed=c)
+                       for m, p, c in pins):
                 continue
             if not offline:
                 # A5 (deep review): the same-route law makes _ping_route_once('')
@@ -1528,8 +1545,9 @@ def _quota_refusal(graph, routes=None, cache_path=None, skip=()):
                 # provider-less (seat-default) route recovers on a pong whose
                 # RECORDED MODEL is the stamped one (_ping_reachable: reachability,
                 # not alive-attribution; an exception, an unimportable core, or a
-                # fallback-ladder answer never recovers).
-                prov = str(res.get("provider") or "")
+                # fallback-ladder answer never recovers). #499: ping the subscription
+                # the MARK names (post-#499 entries carry it in the record).
+                prov = _common.quota_stamp_provider(key, hit) or str(res.get("provider") or "")
                 recovered = (_ping_route_once(prov, key).get("liveness") == "alive"
                              if prov else _ping_reachable(key))
                 if recovered:
