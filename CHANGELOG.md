@@ -9,6 +9,33 @@
   Tests: tests/test_graph_legacy_pin_hw_sl0.py.
 ## Unreleased
 
+- fix(runner): the `bead_close` gate now rides the two remaining done-commit
+  edges — the `on_skip:"pass"` skip-pass commit and the `on_exit` terminal
+  postmortem commit (est-13z1 law; est-ikeon, the R8 sibling sweep of PR #523).
+  The commit-edge census applies BOTH boundary gates (`_effect_gate`, then
+  `_bead_close_gate`) on the agent-solo, fan-out aggregate and echo paths; these
+  two rode the effect gate alone. The door admits the combo (`on_skip` validates
+  as enum + `when`-presence, `bead_close` by shape only), so an agent
+  `{bead_close, when: false, on_skip: "pass"}` with NO effects booked
+  `done {agent:"skipped"}` with ZERO store read-back — the 13z1 lying-done at
+  the skip edge — and the terminal postmortem booked its `done` on the child's
+  prose. PRE-EXISTING on main, not introduced by #523, which stays
+  owner-scoped to the #56 axis and certified at head 47879ee: this lands as a
+  stacked follow-up, forward-only. Each edge now reads the estate store itself
+  and an unproven close DEMOTES the commit to typed `failed`
+  (`error_class:"bead_close"`, `error: bead_close_unproven: ...`, the measured
+  row rides the record, never retried). The skip edge reuses the gate-agnostic
+  demote branch #523 landed; the `on_exit` demote moves the node record and
+  `on_exit_receipt.md`, never the run verdict — `write_runner_exit` stamps that
+  before `_run_on_exit` runs (#129), asserted not assumed. Honest degradation
+  holds: no `bead_close` key = today's behavior byte-identical, not one probe
+  argv spent. Join/consolidate/gate commit edges stay exempt — their closed key
+  sets carry neither gate key, so the door refuses the declaration before a
+  runner must honour one. New test: tests/test_skip_pass_bead_close_ikeon.py
+  (red at 47879ee on the four close-claim cases a/b/d/e, green on the two
+  honest-degradation controls c/f; 6/6 green after).
+
+
 - docs(agents): AGENTS.md folded under core's 32,000-char subdirectory-hint cap — the §3c template catalog, the §3b 1.0.1 settings variant, and the §5 runtime map are relocated to references/example-tour.md (deduplicated, one copy per paragraph, per-fold headings); tests/test_docs_hint_cap_73c.py pins the cap, fold pointers, fence parity, and fold-not-clone (the over-cap file silently dropped §3e/§4 on every mid-run hint load).
 - feat(ci): P1 observe instruments for the estate-ci contract (NEXTGEN-CI
   (b)/(c)/(d)/(e) P1; spec ledger estate run 20261021-195954). OBSERVE mode
@@ -1350,7 +1377,6 @@ Every feature is OPTIONAL: a no-team run (default profile, no `WF_RUNS_ROOT`) is
 - Document the detached runner's lifecycle and the stop-before-disable rule;
   align the documented Hermes floor and catalog metadata.
 
-
 ## 1.0.10 — 2026-09-27 — child work dir is writable under HERMES_WRITE_SAFE_ROOT
 
 - A child's advertised durable work dir (`<run>/work/<node>[.<i>]`) is now
@@ -1496,7 +1522,6 @@ verbs, zero new graph keys.
 - Fan-out without `quorum` waits for ALL items (stragglers cancel only on an explicit
   `quorum`); the commit threshold is unchanged — partial credit survives.
 - budgets.md shrinks to the `shape` presets the door already bakes; a test locks doc==code.
-
 
 ## 1.0.1 — 2026-09-25
 

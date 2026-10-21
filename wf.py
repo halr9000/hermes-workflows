@@ -8781,6 +8781,13 @@ def _run_on_exit(run, graph, meta, status):
         rec = _final_quiesce(child_meta, rec, "node", {"node": nid})
         rec = _stamp_served(child_meta, rec, node)
         rec = _effect_gate(run, node, _lane_gate(run, node, rec))
+        # est-ikeon (est-13z1 law): the terminal postmortem commit is a commit
+        # edge like any other — a declared `bead_close` is read back from the
+        # estate store HERE, not taken from the child's prose. The run verdict
+        # is untouched either way: write_runner_exit stamps it BEFORE
+        # _run_on_exit runs (#129), so the demote lands on the node record and
+        # on_exit_receipt.md. Undeclaring nodes never touch the store.
+        rec = _bead_close_gate(run, node, rec)
     except Exception as exc:
         rec = {"status": "failed", "error_class": "crashed",
                "error": f"on_exit: {type(exc).__name__}: {exc}"}
@@ -9378,9 +9385,19 @@ def main(run_id):
                             # Effects-free nodes pass through UNTOUCHED (the gate
                             # is a no-op without `effects`): byte-identical for
                             # every existing on_skip:pass graph.
+                            # est-ikeon (est-13z1 law): the bead-close gate rides
+                            # this edge too — the census applies BOTH boundary
+                            # gates at every commit edge, and a false predicate
+                            # guarantees the node never ran, so a `bead_close`
+                            # declaration here is a close claim with zero work
+                            # behind it, read back from the store or demoted.
+                            # The demote branch below is gate-agnostic
+                            # (`status != done`, `error`, `error_class` with an
+                            # `effect_receipt` default), so no branch changes.
                             _srec = _effect_gate(run, n, {"status": "done",
                                                          "output": {"agent": "skipped"},
                                                          "ms": 0})
+                            _srec = _bead_close_gate(run, n, _srec)
                             save_node(run, n, rs.byid, _srec)
                             if _srec["status"] != "done":
                                 log(run, "node.failed", node=n["id"],
