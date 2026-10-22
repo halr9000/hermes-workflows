@@ -29,18 +29,32 @@ probe log; G books partial over a dirty lane; D/E/F already pass — honest
 paths must not move):
 
   A  effects DECLARED, file never written  -> demoted failed, typed
-     error_class=effect_receipt, the harvest still rides the record's output.
+     error_class=effect_receipt, the harvest still rides the record's output,
+     and the node.failed EVENT names the budget cause (A5, est-6ig3s).
   B  effects declared, file honestly written -> stays partial, effect_receipts
      proves it, node.finished(harvested, budget_exhausted) stands.
   C  bead_close {item} template, store says open -> demoted failed
      error_class=bead_close; the measured row rides the ITEM record inside
-     all_results and the aggregate carries the sparse plural enumeration.
+     all_results and the aggregate carries the sparse plural enumeration; the
+     demote event names the budget cause (C6).
   D  bead_close, store says closed -> stays partial with the plural key.
   E  NO gate declaration -> byte-identical to the pre-fix record: same status,
-     same error string, no gate keys minted, and the fake bd is never invoked.
+     same error string, no gate keys minted, the fake bd is never invoked, and
+     the harvested node.finished key set is PINNED (E4) — the cause kv belongs
+     to the demote line only, never to the honest path.
   F  close-pending honest escape -> no probe, stays partial, record pristine.
   G  repo lane DECLARED and dirty -> _lane_gate demotes incomplete_work
-     BEFORE the other gates see the record (they no-op on failed).
+     BEFORE the other gates see the record (they no-op on failed); the demote
+     event names the budget cause (G3).
+
+The A5/C6/G3+E4 pair is the est-6ig3s contract, found in review of THIS branch:
+the demote replaced node.finished(harvested=True, error_class=budget_exhausted)
+with node.failed(<gate class>), so an event-only reader saw the gate's verdict
+and never the cap that put the node in the capped-with-harvest position — the
+same legibility est-60ca closed on the solo path (`item.finished` carries
+harvested + error_class on cap-exhausted). The gate's class stays the verdict in
+`error_class`; the cap rides the same line as `budget_cause`, `harvested` and
+`harvested_items`.
 
 Harness: test_run_budget_3acn LEG C (in-process run_agent_node, sqlite-billed
 fake hermes as the meter, sequential fan-out so the cap boundary is
@@ -203,6 +217,11 @@ check("A4 the event is node.failed with the demote class, never a harvested node
       any(e.get("event") == "node.failed" and e.get("error_class") == "effect_receipt"
           for e in evA)
       and not any(e.get("event") == "node.finished" for e in evA), evA[-3:])
+demA = [e for e in evA if e.get("event") == "node.failed"]
+check("A5 the demote event still names the budget cause and the harvest — an event-only reader sees the cap, not just the gate (est-6ig3s)",
+      len(demA) == 1 and demA[0].get("harvested") is True
+      and demA[0].get("budget_cause") == "budget_exhausted"
+      and demA[0].get("harvested_items") == 1, json.dumps(demA))
 
 # ---- LEG B: effect honestly written -> stays partial, receipts prove it -----
 os.environ["WF4_WRITE"] = "lane/out.md"
@@ -242,6 +261,12 @@ check("C4 the aggregate carries the sparse self-indexed plural enumeration",
 check("C5 non-committing (refused) items stay pristine — no receipt minted on them",
       "bead_close_receipt" not in (recC.get("output") or {}).get("all_results", [{}, {}])[1],
       (recC.get("output") or {}).get("all_results", [{}, {}])[1])
+demC = [e for e in events(rC) if e.get("event") == "node.failed"]
+check("C6 the bead_close demote event names the budget cause too (same contract on every gate's demote line)",
+      len(demC) == 1 and demC[0].get("error_class") == "bead_close"
+      and demC[0].get("harvested") is True
+      and demC[0].get("budget_cause") == "budget_exhausted"
+      and demC[0].get("harvested_items") == 1, json.dumps(demC))
 
 # ---- LEG D: store says CLOSED -> stays partial with the proof ---------------
 set_store(**{"est-ps8i9-0": "closed"})
@@ -272,6 +297,10 @@ check("E2 the store was never probed — zero argv for an undeclared node",
 check("E3 harvested node.finished stands with the budget class",
       any(e.get("event") == "node.finished" and e.get("harvested") is True
           and e.get("error_class") == "budget_exhausted" for e in events(rE)))
+finE = [e for e in events(rE) if e.get("event") == "node.finished"]
+check("E4 the golden event key set is pinned — the honest path mints no cause kv (EMPTY-diff law: the cause kv belongs to the demote line only)",
+      len(finE) == 1 and set(finE[0]) == {"ts", "event", "node", "harvested", "error_class"},
+      json.dumps(finE))
 
 # ---- LEG F: per-item honest non-claim -> no probe, stays partial ------------
 BDLOG.write_text("")
@@ -303,6 +332,12 @@ check("G1 budget-partial over a dirty declared lane demotes, typed incomplete_wo
 check("G2 the demote names the lane and the dirty count; harvest survives",
       "lane dirty after commit-time review" in (recG.get("error") or "")
       and len((recG.get("output") or {}).get("items") or []) == 1, (recG.get("error") or "")[:160])
+demG = [e for e in events(rG) if e.get("event") == "node.failed"]
+check("G3 the lane demote event names the budget cause as well — the cap is the reason this node was capping at all",
+      len(demG) == 1 and demG[0].get("error_class") == "incomplete_work"
+      and demG[0].get("harvested") is True
+      and demG[0].get("budget_cause") == "budget_exhausted"
+      and demG[0].get("harvested_items") == 1, json.dumps(demG))
 
 print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
 sys.exit(0 if ok else 1)

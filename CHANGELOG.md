@@ -15,9 +15,18 @@
   The record now runs the same boundary chain as the aggregate edge —
   `_lane_gate`, then `_effect_gate`, then `_bead_close_gate` (per-item
   read-back included) — and an unproven claim DEMOTES it to the gate's own
-  typed `failed` (`node.failed` logged; the harvest still rides the demoted
-  record's output — the demote kills the claim, never the work). The zero-
-  harvest commit stays `failed` and ungated: nothing is asserted there. A
+  typed `failed` (the harvest still rides the demoted record's output — the
+  demote kills the claim, never the work). That demote line NAMES THE CAP TOO
+  (est-6ig3s, review of this entry's own branch): `node.failed` keeps the
+  gate's verdict in `error_class` and adds `harvested`,
+  `budget_cause: budget_exhausted` and `harvested_items`, because the demote
+  otherwise swallowed the one event that named the node-level budget cause and
+  an event-only reader read `effect_receipt` where the truth was "an unproven
+  claim on a capped fan-out that banked N items" (the legibility est-60ca
+  closed on the solo path). The honest commit keeps `node.finished
+  harvested=True error_class=budget_exhausted` and mints none of the cause kv
+  — the golden pins that key set. The zero-harvest commit stays `failed` and
+  ungated: nothing is asserted there. A
   demoted budget commit also forfeits est-3acn's graceful closure — a capped
   run whose capped commit cannot be proven must not close gracefully over the
   lie (the demote classes are proven-fails, outside both ladders). Honest
@@ -29,7 +38,10 @@
   read-back gates exist for — to paper over a gate the runner simply never
   ran. New test: tests/test_budget_fanout_gates_ps8i9.py (red at 8fd158ca on
   legs A/C/G — one failing-if-broken leg per gate key on that branch, lane
-  gate included; honest legs B/D/E/F green BEFORE and AFTER).
+  gate included; honest legs B/D/E/F green BEFORE and AFTER). Its event-shape
+  asserts A5/C6/G3 + the golden key-set pin E4 carry the est-6ig3s contract:
+  red at 103284a on A5/C6/G3 (the demote line carried no cause), green after,
+  E4 green across the whole sitting — the honest event never grows a key.
 
 - fix(runner): the `bead_close` gate now rides the two remaining done-commit
   edges — the `on_skip:"pass"` skip-pass commit and the `on_exit` terminal

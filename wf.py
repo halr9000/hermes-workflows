@@ -8171,9 +8171,24 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                         log(run, "node.finished", node=nid, harvested=True,
                             error_class="budget_exhausted")
                     else:
+                        # est-6ig3s (review of this branch's own demote): the
+                        # gate's verdict must not ECLIPSE the cap. The demote
+                        # replaces node.finished(harvested=True, error_class=
+                        # budget_exhausted), so an event-only reader saw only
+                        # the gate class and never learned this was a capped
+                        # fan-out that banked a harvest — the legibility
+                        # est-60ca closed on the solo path (item.finished
+                        # carries harvested + error_class on cap-exhausted).
+                        # The gate class stays the verdict in `error_class`;
+                        # the cause rides the SAME line as `budget_cause`, with
+                        # the banked work in `harvested`/`harvested_items`. The
+                        # honest path mints none of it (golden E pins the key
+                        # set): these kv appear only where a harvest was banked
+                        # and a claim then failed.
                         log(run, "node.failed", node=nid, error=_prec.get("error"),
                             error_class=_prec.get("error_class", "incomplete_work"),
-                            attempts=1)
+                            harvested=True, budget_cause="budget_exhausted",
+                            harvested_items=len(merged), attempts=1)
                 else:
                     fails = [{"index": i, "item": results[i].get("item"),
                               "error": (results[i].get("error") or "")[:300],

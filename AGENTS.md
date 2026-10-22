@@ -263,6 +263,12 @@ publication guards, and crash recovery.
   USD is excluded per the repo cost-trust law, issue #124) refused the spawn BEFORE submit, logged as
   `dispatch.refused` and never billing (zero attempts); the runner closes the run gracefully as
   `partial` and `budget_ledger.json` names the never-launched nodes. Terminal: outside every retry ladder.
+  A capped fan-out that DID harvest is a committing record, so it passes the boundary gates (est-ps8i9); when a
+  gate demotes it, the `node.failed` line keeps the gate's verdict in `error_class` and names the cap on the SAME
+  line — `harvested=True budget_cause=budget_exhausted harvested_items:N` (est-6ig3s), because that node-level
+  cause otherwise lived only on the `node.finished` the demote replaced and an event-only reader would misread an
+  unproven claim as an uncapped death. The proven/undeclared commit keeps `node.finished harvested=True
+  error_class=budget_exhausted` and mints none of the cause kv.
   `seat_wait` (est-g2xx): no global agent seat (`WORKFLOW_MAX_SEATS`) freed within the node wall — the spawn never happened.
   `seat_unsupported` (est-g255): the semaphore was full and the host exposes no process-ancestry
   channel (neither `/proc` nor `ps`), so a nested runner cannot prove which held seat is its own
