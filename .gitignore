@@ -27,3 +27,7 @@ ci-out*/
 *-ci-out*/
 tests/tb-parity-*/
 tests/probe_*/
+
+# transient scratch from routing tests + rerun-shim (never committable; SCRUB_LIST pairs)
+.routing-test-*/
+.wf-rerun-*/
