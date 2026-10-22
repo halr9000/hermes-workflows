@@ -12,6 +12,8 @@ SOURCE_ONLY_TESTS = {
     "tests/test_diagram_law.py", "tests/test_example_census_fanout.py",
     "tests/test_example_issue_to_pr.py", "tests/test_example_release_lifecycle.py",
     "tests/test_lane_recover_8edcc9bf.py", "tests/test_example_exchange_run.py",
+    # merge-assist queue (est-0izi7): changelog.d pin, source-only scripts/changelog_assemble.py
+    "tests/test_changelog_fragments_izi7.py",
     # #298 review (R8 sibling sweep): same shape, source-only lane_recover.py / make_public.py
     "tests/test_lane_recover_legacy_amend_237r4.py", "tests/test_respawn_hardening_723.py",
     "tests/test_crash_no_exit_respawn_718.py", "tests/test_lane_recover_cli_237r3.py",

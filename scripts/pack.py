@@ -196,6 +196,8 @@ SOURCE_ONLY_TESTS = {
     "tests/test_example_issue_to_pr.py": "imports source-only scripts/make_public.py",
     "tests/test_example_release_lifecycle.py": "imports source-only scripts/make_public.py",
     "tests/test_lane_recover_8edcc9bf.py": "executes source-only scripts/lane_recover.py",
+    # merge-assist queue (est-0izi7): the changelog.d pin loads source-only scripts/changelog_assemble.py
+    "tests/test_changelog_fragments_izi7.py": "loads source-only scripts/changelog_assemble.py",
     "tests/test_example_exchange_run.py": "reads source-only scripts/scrub-list.txt",
     "tests/test_lane_recover_legacy_amend_237r4.py": "loads source-only scripts/lane_recover.py",
     "tests/test_respawn_hardening_723.py": "loads source-only scripts/lane_recover.py",
@@ -231,6 +233,9 @@ SOURCE_ONLY_SCRIPTS = {
     # speak estate CI vocabulary (gh, the estate-ci contract repo); not
     # release surface.
     "scripts/timing_observe.py": "estate CI timing-manifest generator (gh log parsing; not release surface)",
+    # merge-assist queue (est-0izi7): changelog.d fragment assembler is release-commit tooling
+    # over the checkout's changelog.d/ — a shipped plugin has no CHANGELOG.md fold to run.
+    "scripts/changelog_assemble.py": "release-commit changelog fragment assembler (reads the checkout's changelog.d/; not release surface)",
     "scripts/registry_observe.py": "estate CI burn-token registry census (not release surface)",
     "scripts/md_inputs_observe.py": "estate CI admission md-input census (not release surface)",
     "scripts/ci_preflight_observe.py": "estate-ci P1 observe preflight runner (fetches the contract at its pin; not release surface)",
