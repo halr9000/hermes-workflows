@@ -241,6 +241,28 @@
   graph co-declaration at submit naming the key (one channel per key). Absent
   args leave `run.json` byte-identical (no-cap stability law).
 
+- fix(runner): `budget_ledger.json` is now MERGE-ON-WRITE (est-y938s, P3 from
+  the PR #529 review — the second row on that same review, est-6ig3s above).
+  The loop's terminal hook rewrote the ledger whole at every budget closure,
+  so the persisted cause was always the LAST occurrence: a run capped first at
+  a fan-out and re-expressed at a downstream node lost the first cause from
+  the ledger. The re-expression is reachable, not hypothetical — a capped
+  fan-out whose boundary-gate demote (est-ps8i9) forfeits the graceful closure
+  leaves a record classed by the GATE, so the hook's re-scan arrives with a
+  narrower set than an earlier closure wrote. The write moves out of the hook
+  into `wf.close_budget_ledger`, the ONE writer: top-level `cause`/`at` now
+  name the FIRST closure (the run's first budget death),
+  `exhausted_nodes`/`never_launched` are first-seen-order unions, and
+  `occurrences[]` is the cause chain in close order — one row per DISTINCT
+  closure, so a benign resume re-passing the hook (the est-3acn resume law: a
+  later pass sees the same file) mints no duplicate row. A pre-fix legacy
+  ledger (no occurrences[]) is absorbed as the chain's first occurrence; the
+  run_state read view is untouched (same top-level keys, now first-cause
+  semantics). Test: tests/test_run_budget_3acn.py grows leg E (two cap
+  occurrences with the real stub meter — a capped fan-out, then a downstream
+  run-scope refusal after a demote narrows the re-scan — asserting ledger
+  CONTENT, not existence; red at 80e4004 on E0, green after).
+
 ## 1.3.9 — 2026-10-17
 
 Patch release: 43 merged PRs since v1.3.8 — runner hardening (zombie-reap

@@ -369,7 +369,7 @@ if callable(close_fn):
     led2 = close_fn(runE, metaE, ["synth"], [])               # the hook, closure 2
     check("E3 merge-on-write: the persisted cause is the FIRST closure's, not the last",
           led2.get("cause") == "budget_exhausted" and led2.get("at") == led1_at
-          and led2.get("at") != led2.get("occurrences", [{}])[-1].get("at"),
+          and led2.get("at") == (led2.get("occurrences") or [{}])[0].get("at"),
           led2)
     occ = led2.get("occurrences") or []
     check("E3 the cause chain holds BOTH closures in order — the fan-out cause survives",

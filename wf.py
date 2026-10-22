@@ -8739,6 +8739,67 @@ def write_runner_exit(run, reason, detail=None, graph=None):
     except Exception:
         pass  # an exit record is diagnostics, never a reason to die differently
 
+
+def close_budget_ledger(run, meta, capped, never):
+    """est-3acn terminal budget hook — the ONE writer of budget_ledger.json,
+    MERGE-ON-WRITE (est-y938s, P3 from the PR #529 review).
+
+    The loop's terminal hook calls this at every budget closure. The file is an
+    accumulating record, never a per-closure snapshot: a run capped first at a
+    fan-out and re-expressed at a downstream node must not lose the FIRST cause
+    from the ledger. The re-expression is real, not hypothetical — a capped
+    fan-out whose boundary-gate DEMOTE (est-ps8i9) forfeits the graceful
+    closure leaves a record classed by the GATE, so the hook's re-scan arrives
+    with a NARROWER set than an earlier closure wrote; overwriting would erase
+    the first cause by construction.
+
+    Top-level keys keep the pre-y938s shape with FIRST-cause semantics: `cause`
+    and `at` name the first closure, `exhausted_nodes`/`never_launched` are the
+    first-seen-order unions across closures, `cap_tokens` the first baked value
+    the ledger ever saw. `occurrences[]` is the cause chain in close order —
+    one row per DISTINCT closure; a benign resume re-closing the same set mints
+    no duplicate row (the est-3acn resume law: a later pass sees the same file).
+    A pre-fix legacy ledger (no occurrences[]) is absorbed: its snapshot joins
+    the chain as the first occurrence, cause intact.
+    """
+    row = {"at": now(), "exhausted_nodes": list(capped), "never_launched": list(never)}
+    led = {"cause": "budget_exhausted", "at": row["at"],
+           "exhausted_nodes": row["exhausted_nodes"],
+           "never_launched": row["never_launched"],
+           "cap_tokens": (meta.get("budget") or {}).get("tokens")
+           if isinstance(meta.get("budget"), dict) else None}
+    prev = jload(run / "budget_ledger.json", {}) or {}
+    if isinstance(prev, dict) and prev.get("cause"):
+        chain = prev.get("occurrences")
+        if not (isinstance(chain, list) and chain and all(isinstance(o, dict) for o in chain)):
+            # Pre-fix legacy snapshot row (or a malformed chain): absorb the
+            # top-level facts as the first occurrence, never discard them.
+            chain = [{"at": prev.get("at"),
+                      "exhausted_nodes": prev.get("exhausted_nodes") or [],
+                      "never_launched": prev.get("never_launched") or []}]
+        last = chain[-1]
+        if (last.get("exhausted_nodes") or []) == row["exhausted_nodes"] \
+                and (last.get("never_launched") or []) == row["never_launched"]:
+            return prev                     # same closure re-passed: no duplicate row
+        prev_cap = prev.get("cap_tokens")
+        led["cause"] = prev.get("cause") or led["cause"]      # the FIRST cause stands
+        led["at"] = chain[0].get("at") or led["at"]           # the first closure's instant
+        dedup = lambda xs: list(dict.fromkeys(xs))            # first-seen order
+        led["exhausted_nodes"] = dedup(
+            [n for o in chain for n in (o.get("exhausted_nodes") or [])] + row["exhausted_nodes"])
+        led["never_launched"] = dedup(
+            [n for o in chain for n in (o.get("never_launched") or [])] + row["never_launched"])
+        led["cap_tokens"] = prev_cap if prev_cap is not None else led["cap_tokens"]
+        led["occurrences"] = chain + [row]
+    else:
+        led["occurrences"] = [row]
+    lp = run / "budget_ledger.json"
+    tmp = lp.with_name(f"budget_ledger.json.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(led, ensure_ascii=False))
+    os.replace(tmp, lp)                     # atomic: durable ledger
+    return led
+
+
 def _terminal_status(reason):
     if reason in ("done", "stopped"):
         return reason
@@ -9192,20 +9253,18 @@ def main(run_id):
         # prune cascade: a capped run closes GRACEFULLY as `partial`, never
         # stumbles into `blocked by failed` prose. The durable ledger names the
         # cap deaths and every node that NEVER LAUNCHED (pending at the instant
-        # of closing — derived, not guessed; a later resume sees the same file).
-        # finalize() commits the run.partial fact; the runner_exit verdict
-        # `budget_exhausted` rides main()'s write at exit — run_state reads
-        # both and reports status=partial + the derived budget view.
+        # of closing — derived, not guessed). est-y938s: the write is
+        # MERGE-ON-WRITE — every closure lands through close_budget_ledger, so
+        # a re-expression downstream (a demoted record shrinks the re-scan, and
+        # a later resume re-passes this hook) accumulates the occurrences[]
+        # cause chain instead of overwriting the first cause; a same-set
+        # re-closure mints no duplicate row. finalize() commits the
+        # run.partial fact; the runner_exit verdict `budget_exhausted` rides
+        # main()'s write at exit — run_state reads both and reports
+        # status=partial + the derived budget view.
         if _capped:
             never = [n["id"] for n in rs.nodes if states[n["id"]] == "pending"]
-            led = {"cause": "budget_exhausted", "at": now(),
-                   "exhausted_nodes": _capped, "never_launched": never,
-                   "cap_tokens": (meta.get("budget") or {}).get("tokens")
-                   if isinstance(meta.get("budget"), dict) else None}
-            lp = run / "budget_ledger.json"
-            tmp = lp.with_name(f"budget_ledger.json.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(led, ensure_ascii=False))
-            os.replace(tmp, lp)                       # atomic: durable ledger
+            close_budget_ledger(run, meta, _capped, never)
             log(run, "run.budget_exhausted", nodes=_capped, never_launched=never)
             finalize(run, rs.graph, "partial")
             return "budget_exhausted"
