@@ -4,7 +4,7 @@
 The on-row design (comments 2026-10-13/14, issue #124): the cap is TOKENS-ONLY.
 USD is EXCLUDED per the repo cost-trust law — an author who writes budget.usd
 is REFUSED at admission, never silently ignored (a dropped cap key is a cap the
-author believes is on). Four pinned legs:
+author believes is on). Five pinned legs:
 
   A  REFUSAL BEFORE SPAWN — a node under `budget:{tokens:N}` whose measured
      spend (+ its per-attempt mean) reaches the cap refuses at the run_child
@@ -25,6 +25,13 @@ author believes is on). Four pinned legs:
      pre-budget golden set verbatim, `budget` never enters the node efp
      (policy keys are excluded from def-hash, same law as run_budget), and the
      door bakes meta.budget only when the graph declared one.
+  E  TWO-CAP CLOSURES (est-y938s) — the terminal budget hook is
+     MERGE-ON-WRITE: a run capped first at a fan-out and re-expressed at a
+     downstream node keeps its FIRST cause at the top level (cause/at name
+     the first closure), every distinct closure rides the occurrences[]
+     chain in close order, a pre-fix legacy snapshot row is absorbed as the
+     chain's first occurrence, and a benign resume re-closing the SAME set
+     mints no duplicate row.
 
 Run: env -u WF_RUNS_ROOT -u HERMES_HOME PYTHONPATH=/opt/hermes
      /opt/hermes/.venv/bin/python tests/test_run_budget_3acn.py
@@ -301,6 +308,94 @@ with door_env() as spawned:
               and set(stD) == {"run_id", "name", "status", "accounting", "failed_nodes",
                                "held_gate", "nodes", "graph", "runner_live", "runner_exit", "runner_lock",
                                "started", "owner", "done", "skipped", "total"}, sorted(stD))
+
+# ---- LEG E: est-y938s — TWO cap closures, merge-on-write ledger --------------
+# The defect (P3 from the PR #529 review): the terminal hook OVERWROTE
+# budget_ledger.json at every closure, so a run capped first at a fan-out and
+# re-expressed downstream persisted only the LAST cause. The re-expression is
+# reachable in the real flow: a capped-with-harvest fan-out whose boundary-gate
+# DEMOTE (est-ps8i9) forfeits the graceful closure leaves a record classed by
+# the GATE, so the hook's re-scan arrives with a NARROWER set — an overwrite
+# loses the first cause by construction.
+runE = mkrun("r3acn-e")
+close_fn = getattr(wf, "close_budget_ledger", None)
+check("E0 the terminal hook is a named closer the run can re-drive (est-y938s)",
+      callable(close_fn))
+if callable(close_fn):
+    # Occurrence 1: a REAL capped fan-out WITH harvest (leg C machinery: item 0
+    # rides and bills 1000, item 1 refuses pre-dispatch).
+    nodeE1 = {"id": "fo", "type": "agent", "goal": "item {INDEX}",
+              "budget": {"tokens": 1000},
+              "fanout": {"items": [{"n": 0}, {"n": 1}]}}
+    nodeE2 = {"id": "synth", "type": "agent", "goal": "g"}
+    byidE = {"fo": nodeE1, "synth": nodeE2}
+    metaE = base_meta(runE)
+    metaE["item_concurrency"] = 1
+    metaE["budget"] = {"tokens": 1000}              # door-baked run-scope shape
+    (runE / "graph.json").write_text(json.dumps({"name": "e", "nodes": [nodeE1, nodeE2]}))
+    popsE0 = pops()
+    wf.run_agent_node(runE, metaE, byidE, nodeE1, {}, [])
+    recE = json.loads((runE / "nodes" / "fo.json").read_text())
+    check("E1 occurrence 1 is the real cap: fan-out partial + budget class",
+          recE.get("status") == "partial"
+          and recE.get("error_class") == "budget_exhausted",
+          f"status={recE.get('status')} class={recE.get('error_class')}")
+    led1 = close_fn(runE, metaE, ["fo"], ["synth"])           # the hook, closure 1
+    check("E1 the first closure writes cause+nodes+never and a one-row chain",
+          led1.get("cause") == "budget_exhausted"
+          and led1.get("exhausted_nodes") == ["fo"]
+          and led1.get("never_launched") == ["synth"]
+          and led1.get("cap_tokens") == 1000
+          and led1.get("occurrences") == [{"at": led1.get("at"),
+                                           "exhausted_nodes": ["fo"],
+                                           "never_launched": ["synth"]}], led1)
+    led1_at = led1.get("at")
+    # The est-ps8i9 demote, replayed on the record: the gate's verdict replaces
+    # the budget class, so the hook's re-scan no longer sees `fo`.
+    (runE / "nodes" / "fo.json").write_text(json.dumps(
+        {**recE, "status": "failed", "error_class": "effect_receipt"}))
+    # Occurrence 2: the downstream node re-expresses the SAME run cap — and the
+    # refusal is REAL, not staged: run-scope spent is the fan-out's 1000.
+    rE2 = wf.run_child(metaE, nodeE2, byidE, "g", "", None, skey="wf:r3acn-e:synth")
+    check("E2 occurrence 2 refuses at the run cap BEFORE spawn (re-expressed)",
+          rE2.get("status") == "failed"
+          and rE2.get("error_class") == "budget_exhausted"
+          and "run-scope" in (rE2.get("error") or "")
+          and pops() == popsE0 + 1,   # the fan-out's one billed item; refusal bills zero
+          {"r": rE2, "pops": pops()})
+    wf.save_node(runE, nodeE2, byidE,
+                 {"status": "failed", "error_class": "budget_exhausted",
+                  "error": rE2.get("error")})
+    led2 = close_fn(runE, metaE, ["synth"], [])               # the hook, closure 2
+    check("E3 merge-on-write: the persisted cause is the FIRST closure's, not the last",
+          led2.get("cause") == "budget_exhausted" and led2.get("at") == led1_at
+          and led2.get("at") != led2.get("occurrences", [{}])[-1].get("at"),
+          led2)
+    occ = led2.get("occurrences") or []
+    check("E3 the cause chain holds BOTH closures in order — the fan-out cause survives",
+          [o.get("exhausted_nodes") for o in occ] == [["fo"], ["synth"]]
+          and [o.get("never_launched") for o in occ] == [["synth"], []], occ)
+    check("E3 the union view names both cap deaths; the file on disk IS the returned ledger",
+          led2.get("exhausted_nodes") == ["fo", "synth"]
+          and led2.get("never_launched") == ["synth"]
+          and (runE / "budget_ledger.json").read_text()
+              == json.dumps(led2, ensure_ascii=False), led2)
+    # Idempotence: a benign resume re-passes the hook with the SAME recomputed
+    # set (the est-3acn resume law — a later pass sees the same file).
+    led3 = close_fn(runE, metaE, ["synth"], [])
+    check("E4 a re-closure with the same set mints no duplicate row (resume law)",
+          led3.get("occurrences") == occ and led3.get("at") == led1_at, led3)
+    # Absorption: a ledger written by the PRE-FIX overwrite closure (no
+    # occurrences[]) joins the chain as its first occurrence, cause intact.
+    runE2 = mkrun("r3acn-e2")
+    legacy = {"cause": "budget_exhausted", "at": "2026-10-15T12:00:00+00:00",
+              "exhausted_nodes": ["fo"], "never_launched": ["synth"]}
+    (runE2 / "budget_ledger.json").write_text(json.dumps(legacy))
+    ledL = close_fn(runE2, base_meta(runE2), ["gate-x"], [])
+    check("E5 a pre-fix legacy row joins the chain as the first occurrence",
+          ledL.get("cause") == "budget_exhausted" and ledL.get("at") == legacy["at"]
+          and [o.get("exhausted_nodes") for o in ledL.get("occurrences") or []]
+              == [["fo"], ["gate-x"]], ledL)
 
 print(("ALL PASS " if ok else "FAILURES PRESENT ") + "test_run_budget_3acn")
 raise SystemExit(0 if ok else 1)
