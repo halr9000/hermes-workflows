@@ -151,6 +151,15 @@ regex:est-13z1
 regex:haus-docs
 tests/fake_bd_close_13z1.py
 tests/test_bead_close_claim_13z1.py
+# ---- est-ikeon (2026-10-21): the bead_close gate on the skip-pass + on_exit edges ----
+# The est-13z1 regression suite that grew onto two more commit edges carries the same
+# estate actor vocabulary as its parent above: "gh-dispatch" as the ASSIGNEE value of a
+# bead row in a FAKE-bd fixture (scrub-list line 23, estate-vocab alternation). The row
+# is the fixture's ground truth that the read-back gate is pinning a store against — the
+# check is meaningless without an assignee the child may not close as. File-guarded
+# exactly like tests/test_bead_close_claim_13z1.py: the est-867 lesson is that file:LINE
+# anchors rot on the next edit of a test that is meant to be extended. GUARD, per AGENTS.md rule 4.
+tests/test_skip_pass_bead_close_ikeon.py
 # ---- est-o8c6o (2026-10-11): the diff-scoped gate re-worded the ::error:: line ----
 # est-q2nwx's line anchor (:32) went stale because the diff-scope re-word moved the
 # citation line and kept the same mandated standard citation. Anchored by the citation
