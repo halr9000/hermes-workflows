@@ -8147,13 +8147,33 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                 dies = [i for i, r in enumerate(results)
                         if r.get("error_class") == "budget_exhausted"]
                 if merged:
-                    save_node(run, node, byid, {"status": "partial",
-                                                "error_class": "budget_exhausted",
-                                                "error": f"budget_exhausted: {len(dies)}/{len(items)} items "
-                                                         f"refused at the RunBudget cap; harvested {len(merged)}",
-                                                "output": {"items": merged, "all_results": results}})
-                    log(run, "node.finished", node=nid, harvested=True,
-                        error_class="budget_exhausted")
+                    # est-ps8i9 (est-13z1/#56 law, R8 sweep of #525): a budget
+                    # partial IS a committing record (#4: partial IS committed
+                    # output), so it takes the SAME commit-edge boundary chain
+                    # as the aggregate and solo edges — lane, then effect, then
+                    # bead-close — before the record may land. A capped fan-out
+                    # declaring {effects} or {bead_close id:{item}} used to bank
+                    # its harvest with ZERO read-back: the lying-done class at
+                    # the third commit edge. An unproven claim now DEMOTES this
+                    # record exactly as at the other edges (the demote branch
+                    # below mirrors the aggregate edge's); the honest no-key node
+                    # passes every gate untouched — byte-identical (golden E).
+                    _prec = {"status": "partial",
+                             "error_class": "budget_exhausted",
+                             "error": f"budget_exhausted: {len(dies)}/{len(items)} items "
+                                      f"refused at the RunBudget cap; harvested {len(merged)}",
+                             "output": {"items": merged, "all_results": results}}
+                    _prec = _lane_gate(run, node, _prec)          # 64c6772b: a declared lane must be clean at commit
+                    _prec = _effect_gate(run, node, _prec)        # #56: receipts proven at commit
+                    _prec = _bead_close_gate(run, node, _prec)    # est-13z1: a claimed close in ANY item output is read back from the store at commit
+                    save_node(run, node, byid, _prec)
+                    if _prec["status"] == "partial":
+                        log(run, "node.finished", node=nid, harvested=True,
+                            error_class="budget_exhausted")
+                    else:
+                        log(run, "node.failed", node=nid, error=_prec.get("error"),
+                            error_class=_prec.get("error_class", "incomplete_work"),
+                            attempts=1)
                 else:
                     fails = [{"index": i, "item": results[i].get("item"),
                               "error": (results[i].get("error") or "")[:300],

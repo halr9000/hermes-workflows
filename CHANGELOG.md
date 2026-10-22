@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- fix(runner): the RunBudget-capped fan-out `partial` (the est-3acn harvest
+  path) is a commit edge — the lane, effect and bead-close gates now run over
+  its record before save (est-13z1/#56 law; est-ps8i9, adversarial R8 sweep of
+  PR #525 @8fd158ca — the census row the #525 entry's edge list missed). The
+  budget elif committed `{status: partial, output:{items, all_results}}`
+  straight to `save_node` inside its own branch (`merged_rec` is assigned only
+  in the else), so a fan-out declaring `{effects}` or `{bead_close id:{item}}`
+  that the cap cuts mid-run banked harvested item outputs with ZERO store
+  read-back and ZERO receipt proof: the est-13z1 lying-done class at the THIRD
+  commit edge, PRE-EXISTING on main (est-3acn era), not introduced by #525.
+  The record now runs the same boundary chain as the aggregate edge —
+  `_lane_gate`, then `_effect_gate`, then `_bead_close_gate` (per-item
+  read-back included) — and an unproven claim DEMOTES it to the gate's own
+  typed `failed` (`node.failed` logged; the harvest still rides the demoted
+  record's output — the demote kills the claim, never the work). The zero-
+  harvest commit stays `failed` and ungated: nothing is asserted there. A
+  demoted budget commit also forfeits est-3acn's graceful closure — a capped
+  run whose capped commit cannot be proven must not close gracefully over the
+  lie (the demote classes are proven-fails, outside both ladders). Honest
+  degradation is asserted as the golden control: no gate key = today's
+  byte-identical record and events, ZERO probe argv (exact pre-fix error
+  string and key set pinned). Run-the-gates over reject-at-door: refusing
+  `budget` + `effects`/`bead_close` on fan-outs at the door would price
+  cap-protection out of the close-the-queue lanes — the exact lanes the
+  read-back gates exist for — to paper over a gate the runner simply never
+  ran. New test: tests/test_budget_fanout_gates_ps8i9.py (red at 8fd158ca on
+  legs A/C/G — one failing-if-broken leg per gate key on that branch, lane
+  gate included; honest legs B/D/E/F green BEFORE and AFTER).
+
 - fix(runner): the `bead_close` gate now rides the two remaining done-commit
   edges — the `on_skip:"pass"` skip-pass commit and the `on_exit` terminal
   postmortem commit (est-13z1 law; est-ikeon, the R8 sibling sweep of PR #523).
@@ -24,7 +53,11 @@
   holds: no `bead_close` key = today's behavior byte-identical, not one probe
   argv spent. Join/consolidate/gate commit edges stay exempt — their closed key
   sets carry neither gate key, so the door refuses the declaration before a
-  runner must honour one. New test: tests/test_skip_pass_bead_close_ikeon.py
+  runner must honour one. CORRECTION (est-ps8i9, the R8 sweep of THIS PR's own
+  head): the word "remaining" over-claimed — beyond these two done-commits, the
+  est-3acn budget-capped fan-out PARTIAL commit rode NEITHER gate (not merely
+  the effect gate) and the enumeration missed it; that edge is named, gated,
+  and pinned by the est-ps8i9 entry above. New test: tests/test_skip_pass_bead_close_ikeon.py
   (red at 47879ee on the four close-claim cases a/b/d/e, green on the two
   honest-degradation controls c/f; 6/6 green after).
 
