@@ -38,8 +38,10 @@ have refused, reached through a hand-edited `graph.json`) reads as `full`: the f
 for a wake is always the loud one.
 
 **`[SILENT]`** is the Hermes convention, honored at exactly one seam — the run-result wake. On
-`run.done` the runner reads the run's DECLARED verdict: the committed output of the node the graph
-names as top-level `result:` (efp-valid — an amended-away record is not a fact). If the marker
+`run.done` the runner reads the run's DECLARED verdict: the committed output of the node named as
+`result` in the run's own committed `graph.json` (the binding is to the committed file, not to
+whatever graph object the wake call site happened to carry — the `run.done` call site hands a
+nodes-only projection), efp-valid — an amended-away record is not a fact. If the marker
 appears anywhere in that output (a bare string, or any field of a structured answer;
 case-sensitive, matching the host), the wake is suppressed. A suppression is a decision, not a
 delivery failure: it writes exactly ONE probe row — `{"suppressed":"silent_marker",

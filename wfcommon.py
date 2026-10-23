@@ -882,7 +882,7 @@ HARVEST_POLICIES = ("strict", "validate")   # est-ggqs: agent `harvest_policy` v
 #   full   — every notice whose subject is the node wakes (today's behavior).
 #   quiet  — the node's mid-flight OBSERVATIONS (fanout.stragglers) are recorded in
 #            the probe instead of waking; a hold and every run-terminal notice still
-#            wakes.
+#            wake.
 #   silent — every node-SUBJECT notice (including this gate's own hold, which the
 #            author then owns polling) is recorded, not woken.
 # No tier governs run.done / run.failed / run.partial — see wf._TIERED_WAKE_EVENTS.

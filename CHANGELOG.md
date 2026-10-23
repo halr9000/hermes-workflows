@@ -9,6 +9,31 @@
   Tests: tests/test_graph_legacy_pin_hw_sl0.py.
 ## Unreleased
 
+- feat(runner,door): WF-GRAFT-1 — wake-noise control: honor the Hermes `[SILENT]`
+  verdict, and a `wake_tier` ladder over every node (est-1f7cn, PR #533; adapted from
+  itechmeat/hermes-workflows `notifications.py:29-45`, `engine.py:934-936`,
+  `schema/nodes.ts:100-112`, audit est-ll0nn rank 1). The failure prevented: a
+  scheduled graph whose lap finds NOTHING still cost the owner a full agent turn,
+  because the run-result wake always pushes and the only typed suppression in the
+  grammar was `fanout.stragglers` — the honest way to be quiet was to delete the
+  watcher. Now a `run.done` whose DECLARED verdict (the graph's top-level `result:`
+  node, read from the run's committed `graph.json`, efp-valid via `node_rec`) carries
+  `[SILENT]` POSTs nothing and records exactly ONE probe row
+  (`suppressed:"silent_marker"`, `delivered:false`) that no re-drive re-writes and
+  nothing retries; and `wake_tier` (`full`|`quiet`|`silent`; graph top level as the
+  default, per-node on agent/gate, door-validated by value with the set named) quiets
+  the notices whose SUBJECT is that node — `quiet` its fan-out straggler observation,
+  `silent` also its own gate hold, which the author then owns polling. The floor is
+  law, not a default: no tier governs `run.done`/`run.failed`/`run.partial`, a
+  malformed tier reads as `full` (over-wake, never swallow), the operator outbound
+  mirror never consults either reason, and a marker in ANY other node's output
+  changes nothing — binding `[SILENT]` to the declared verdict is what keeps a lane's
+  prose from speaking for the run. Suppressed notices print
+  `WORKFLOW_WAKE_SUPPRESSED` and stay legible in `wake.jsonl`: a suppression, not a
+  hole. Pin: tests/test_wake_silent_tiers_1f7cn.py (33 checks, incl. an in-test
+  mutation proof and an external probe severing the `notify()` seam: 8 FAILs / rc=1).
+  A graph carrying neither key wakes byte-identically.
+
 - fix(watchdog): the fanout.stragglers disc formats a missing launch stamp as
   the `'q'` literal, never through `:.3f` (est-waf8y, est-c0jo1 passport D1).
   An open item queued behind a saturated fan-out cap has no launch stamp; the
