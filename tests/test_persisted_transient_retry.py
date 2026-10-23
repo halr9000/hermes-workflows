@@ -340,7 +340,7 @@ if HAVE_API:
     BASE3 = {"max_attempts": 3, "base_seconds": 1.5, "ceiling_seconds": 5.0}
 
     with tempfile.TemporaryDirectory() as td3:
-        runs, att, env = integration_env(td3, "PTT-RESTART-A", 2)
+        runs, att, env = integration_env(td3, "PTT-RESTART-A", 1)  # one death pre-kill; checks demand exactly 2 total spawns
         graph = {"name": "ptt-restart",
                  "nodes": [{"id": "a", "type": "agent", "goal": "PTT-RESTART-A"}]}
         with patch.dict(os.environ, env, clear=False):
