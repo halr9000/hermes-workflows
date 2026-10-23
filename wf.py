@@ -7245,14 +7245,16 @@ def _retry_state_read(meta):
         raw = json.loads((meta["_run"] / RETRY_STATE_FILE).read_text())
     except (OSError, ValueError):
         return {}
-    ents = raw.get("entries") if isinstance(raw, dict) else None
-    return ents if isinstance(ents, dict) else {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def _retry_state_write(meta, entries):
+    # est-9ceqc: FLAT {key -> entry} at the top level — the door-side reader
+    # (and every cold reader of the run dir) parses retry_state.json directly;
+    # the shape is the contract (tests/test_persisted_transient_retry.py).
     try:
         tmp = meta["_run"] / (RETRY_STATE_FILE + ".tmp")
-        tmp.write_text(json.dumps({"v": 1, "entries": entries}))
+        tmp.write_text(json.dumps(entries))
         os.replace(tmp, meta["_run"] / RETRY_STATE_FILE)
     except OSError:
         pass      # the state file is the window channel; loss fails open
