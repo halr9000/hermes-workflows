@@ -389,7 +389,7 @@ if HAVE_API:
                   (deadline_hits, t_deadline - time.time()))
             door.act_wait({"run_id": rid, "timeout": 2})
             check("integration: run completes after the window (attempt continues to 2)",
-                  until(lambda: door.act_status({"run_id": rid}).get("state") == "done",
+                  until(lambda: door.act_status({"run_id": rid}).get("status") == "done",
                         25))
             rec = json.loads((rd / "nodes" / "a.json").read_text())
             check("integration: committed record continues the attempt count (2 spawns)",
@@ -419,7 +419,7 @@ if HAVE_API:
             rd = runs / rid
             door.act_wait({"run_id": rid, "timeout": 2})
             ok_run = until(
-                lambda: door.act_status({"run_id": rid}).get("state") in ("failed",),
+                lambda: door.act_status({"run_id": rid}).get("status") in ("failed",),
                 30)
             rec = json.loads((rd / "nodes" / "a.json").read_text()) \
                 if (rd / "nodes" / "a.json").exists() else {}
@@ -462,7 +462,7 @@ if HAVE_API:
                   again)
             door.act_wait({"run_id": rid, "timeout": 2})
             ok_run = until(
-                lambda: door.act_status({"run_id": rid}).get("state") in ("failed",),
+                lambda: door.act_status({"run_id": rid}).get("status") in ("failed",),
                 35)
             rec = json.loads((rd / "nodes" / "a.json").read_text()) \
                 if (rd / "nodes" / "a.json").exists() else {}

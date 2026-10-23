@@ -7383,6 +7383,7 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
     base, ceiling, _ma = _retry_policy_conf_params(meta)   # est-9ceqc
     cap = _transient_cap(meta, node)   # hw-23c author key > door policy (est-9ceqc)
     attempts_log = list(r.get("attempts_log") or [])   # est-ja41: inherited park history
+    inherit_n = len(attempts_log)   # est-9ceqc: where THIS entry's own log starts
     # est-9ceqc: a re-driven (possibly restarted) entry CONTINUES the persisted
     # count — the attempt bound never restarts with the process.
     key = _retry_state_key(ev_kw)
@@ -7490,9 +7491,13 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
         last_spawn = r.get("spawn")
         base_att = (last_spawn + 1 if isinstance(last_spawn, int)
                     else len(attempts_log) + r.get("attempts", 0))
-        # est-9ceqc: the committed attempt count is the WHOLE lifetime — the
-        # persisted seed plus what this entry spawned.
-        r["attempts"] = seed + base_att if seed else base_att
+        # est-9ceqc: the committed attempt count is the WHOLE lifetime. The
+        # runner's spawn_no already counts every re-drive of this node (attempt
+        # keys persist across restarts), so the seed adds nothing when it is
+        # ahead; a synthetic/park-shaped record without a lifetime spawn index
+        # falls back to the persisted seed plus this entry's own appends.
+        r["attempts"] = max(seed + (len(attempts_log) - inherit_n),
+                            base_att) if seed else base_att
         # est-ja41: transport_exhausted is the LADDER's own verdict — "this
         # ladder spent its respawns on the SAME dead model". An inherited park
         # history proves nothing about this ladder; for no-inherit runs
