@@ -9,6 +9,16 @@
   Tests: tests/test_graph_legacy_pin_hw_sl0.py.
 ## Unreleased
 
+- feat(tick-bridge): dormant `cron_bridge.py` — the scheduler-resident tick
+  job lifecycle grafted from the scion cron bridge (est-ip975, WF-GRAFT-3
+  PR-1): a name-keyed singleton (`ensure_tick` — double-arm returns the
+  incumbent id, never a second job), a generated `no_agent=True` shim under
+  HERMES_HOME/scripts execing the plugin's absolute `wf.py tick`,
+  `teardown_tick` deleting (never disabling) the job, cadence resolved
+  env `WF_TICK_SCHEDULE` ▸ config `workflows.tick_schedule` ▸ `every 2m` at
+  call time, honest None/False degradation on a host without core cron. No
+  production caller until the arm-on-launch graft — the test IS the behavior.
+  Tests: tests/test_tick_bridge.py.
 - fix(watchdog): the fanout.stragglers disc formats a missing launch stamp as
   the `'q'` literal, never through `:.3f` (est-waf8y, est-c0jo1 passport D1).
   An open item queued behind a saturated fan-out cap has no launch stamp; the

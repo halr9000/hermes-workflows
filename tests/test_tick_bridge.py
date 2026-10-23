@@ -61,6 +61,7 @@ class FakeJobs:
         self.create_calls = []
         self.remove_calls = []
         self.list_kwargs = []
+        self._seq = 0
 
     def list_jobs(self, include_disabled=False):
         self.list_kwargs.append({"include_disabled": include_disabled})
@@ -68,7 +69,8 @@ class FakeJobs:
 
     def create_job(self, **kw):
         self.create_calls.append(kw)
-        job = {"id": "job-%02d" % (len(self.jobs) + 1)}
+        self._seq += 1
+        job = {"id": "job-%02d" % self._seq}
         job.update(kw)
         self.jobs.append(job)
         return dict(job)
