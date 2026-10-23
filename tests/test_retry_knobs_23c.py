@@ -83,7 +83,11 @@ check("retry rides graph defaults", not e, e)
 
 # ---------- 2. runner ladders honour the caps ----------
 meta_base = {"_run": None, "_stop": threading.Event(), "_procs_lock": threading.Lock(),
-             "_retries_left": 50, "retry_backoff": [0, 0]}
+             "_retries_left": 50, "retry_backoff": [0, 0],
+             # est-9ceqc: the transient schedule is now the persisted exp policy
+             # (superseding the fixed [5, 20] ladder); base_seconds=0 keeps this
+             # fixture exercising the LOOP without sleeping — door channel only.
+             "retry_policy": {"base_seconds": 0}}
 
 
 def mk_meta(tmp, node):
@@ -187,13 +191,15 @@ with tempfile.TemporaryDirectory() as td:
             meta = mk_meta(td, node)
             respawn, calls = fake_bounded("unknown")
             r = wf._transient_retry(meta, death("unknown"), respawn, "node",
-                                    {"node": "a"}, node=node)
+                                    {"node": "a"}, node=node,
+                                    defer=False)  # est-9ceqc: the DEFER law moves the wait to the driver drain; the CAP law this check pins is unchanged — pin the in-place re-drive shape
             check("transient default caps at 2 re-spawns", calls["n"] == 2, calls)
             node = node_with(transient=3)
             meta = mk_meta(td, node)
             respawn, calls = fake_bounded("unknown")
             r = wf._transient_retry(meta, death("unknown"), respawn, "node",
-                                    {"node": "a"}, node=node)
+                                    {"node": "a"}, node=node,
+                                    defer=False)  # est-9ceqc: cap law unchanged; pin the in-place shape
             check("transient 3 caps at 3 re-spawns", calls["n"] == 3, calls)
         finally:
             wf._attempt_api_calls = orig_calls
