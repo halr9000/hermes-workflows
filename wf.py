@@ -7173,7 +7173,179 @@ def _ratelimit_park(meta, r, respawn, ev, ev_kw, node=None, cancel=None,
         r["ratelimit_gave_up"] = True
     return r
 
-def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None):
+# ---------- est-9ceqc (WF-GRAFT-5): persisted transient-retry window ----------
+# Ported from the peer itechmeat/hermes-workflows RetryPolicy: the transient
+# ladder's schedule is now exponential (delay = min(base * 2**(attempt-1),
+# ceiling); defaults base 2.0 s / ceiling 30.0 s, superseding the fixed
+# [5, 20] ladder) and EVERY retry decision persists {attempts, retry_after}
+# per (node, fan-out item index) to <run>/retry_state.json and DEFERS the
+# respawn instead of sleeping in place: the worker returns its slot, the
+# wave/fan-out driver re-drives the unit once wall-clock passes the deadline,
+# and a runner restarted mid-window honors the window before it spawns (no
+# billing into a closed window; attempt counts continue; the bound applies).
+# Door-meta override only (`retry_policy` — same channel law as
+# _retry_conf_params, no env hooks). The Q4 shared budget, the
+# _RETRYABLE_CLASSES gate, the api_calls==0 replay-safety gate, the #61
+# quarantine law, and the _bounded_retry / _ratelimit_park ladders stay
+# untouched — this lands ON TOP of them. run.json stays untouched too: the
+# door owns it; the runner's state file is a sibling.
+RETRY_POLICY_DEFAULTS = (2.0, 30.0, 3)     # base s, ceiling s, TOTAL attempts
+RETRY_STATE_FILE = "retry_state.json"
+
+
+def _retry_policy_conf_params(meta):
+    """est-9ceqc: (base_seconds, ceiling_seconds, max_attempts) come ONLY from
+    run.json meta (the door's channel — no env hooks, per brief law). Malformed
+    values fail OPEN to the defaults: the runner never dies on config, and an
+    honest default beats an invented policy."""
+    rp = meta.get("retry_policy")
+    if not isinstance(rp, dict):
+        rp = {}
+    base = rp.get("base_seconds")
+    base = float(base) if isinstance(base, (int, float)) \
+        and not isinstance(base, bool) and 0 <= float(base) <= 600 \
+        else RETRY_POLICY_DEFAULTS[0]
+    ceiling = rp.get("ceiling_seconds")
+    ceiling = float(ceiling) if isinstance(ceiling, (int, float)) \
+        and not isinstance(ceiling, bool) and 0 <= float(ceiling) <= 1200 \
+        else RETRY_POLICY_DEFAULTS[1]
+    ma = rp.get("max_attempts")
+    ma = ma if type(ma) is int and 1 <= ma <= 9 else RETRY_POLICY_DEFAULTS[2]
+    return base, ceiling, ma
+
+
+def _retry_policy_delay(base, ceiling, attempt):
+    """est-9ceqc: the wait (seconds) before transient re-spawn #attempt
+    (1-indexed): min(base * 2**(attempt-1), ceiling). A non-positive attempt or
+    base disables the wait (door-override base_seconds=0 exercises the loop
+    without sleeping — the peer engine's own seam)."""
+    if attempt < 1 or base <= 0:
+        return 0.0
+    return min(base * (2 ** (attempt - 1)), ceiling)
+
+
+def _transient_cap(meta, node):
+    """est-9ceqc: the transient ladder's re-spawn cap. hw-23c author law FIRST:
+    an explicit node `retry.transient` integer always wins. Otherwise the door
+    policy's total-attempt bound maps to cap = max_attempts - 1 (clamped 0..8);
+    at the default 3 that reproduces today's default cap of 2 exactly."""
+    rb = (node or {}).get("retry")
+    if isinstance(rb, dict) and type(rb.get("transient")) is int:
+        return rb["transient"]
+    return max(0, min(8, _retry_policy_conf_params(meta)[2] - 1))
+
+
+def _retry_state_read(meta):
+    """{key -> entry} for this run's persisted transient-retry windows. A
+    missing/corrupt file is NO pending window (honest degradation — fail-open
+    to today's behavior), never a runner death. Readers take no lock: writes
+    are tmp+os.replace, so a reader sees the whole old file or the whole new
+    file, never a torn one."""
+    try:
+        raw = json.loads((meta["_run"] / RETRY_STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    ents = raw.get("entries") if isinstance(raw, dict) else None
+    return ents if isinstance(ents, dict) else {}
+
+
+def _retry_state_write(meta, entries):
+    try:
+        tmp = meta["_run"] / (RETRY_STATE_FILE + ".tmp")
+        tmp.write_text(json.dumps({"v": 1, "entries": entries}))
+        os.replace(tmp, meta["_run"] / RETRY_STATE_FILE)
+    except OSError:
+        pass      # the state file is the window channel; loss fails open
+
+
+def _retry_state_lock(meta):
+    return meta.setdefault("_retry_state_lock", threading.Lock())
+
+
+def _retry_state_put(meta, key, attempts, retry_after, error_class=None):
+    with _retry_state_lock(meta):
+        ents = _retry_state_read(meta)
+        ent = {"attempts": int(attempts), "retry_after": float(retry_after)}
+        if error_class:
+            ent["last_error_class"] = str(error_class)
+        ents[str(key)] = ent
+        _retry_state_write(meta, ents)
+
+
+def _retry_state_pop(meta, key):
+    with _retry_state_lock(meta):
+        ents = _retry_state_read(meta)
+        if str(key) in ents:
+            del ents[str(key)]
+            _retry_state_write(meta, ents)
+
+
+def _retry_state_key(ev_kw):
+    idx = (ev_kw or {}).get("index")
+    return str((ev_kw or {}).get("node")) if idx is None \
+        else "%s#%s" % ((ev_kw or {}).get("node"), idx)
+
+
+def _retry_window_open(meta, key):
+    """True while a persisted transient-retry deadline for `key` is in the
+    FUTURE: no spawn may happen for that unit before it passes (the restart
+    law — a resumed runner must not fake-bill into a closed window)."""
+    ent = _retry_state_read(meta).get(str(key))
+    try:
+        return isinstance(ent, dict) and float(ent.get("retry_after", 0)) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def _retry_drain(meta, units_fn, redrive, cancel=None):
+    """est-9ceqc deferral drain, shared by the wave loop and the fan-out driver.
+    `units_fn()` returns [(state_key, unit)] for units that still need a drive
+    and carry no committed record; `redrive(units)` re-runs them through the
+    normal worker path (pool map; one fresh entry per unit). The drain waits
+    ONLY on persisted deadlines, chunked so stop/cancel stay observable, and
+    the idle happens on the DRIVER thread while no pool worker carries a
+    deferred unit — a worker slot or seat is never held through the wait. When
+    stop or cancel breaks the drain, every still-deferred unit gets ONE redrive
+    through the spawn gates so the established cancelled/stopped commit shapes
+    land (a straggler at quorum still books `cancelled`, sprint101 #7 law).
+    Fail-open: units without a state entry are not ours; a due-pass that
+    changes nothing breaks instead of spinning."""
+    sig_prev = None
+    while not (meta["_stop"].is_set() or (cancel is not None and cancel.is_set())):
+        ents = _retry_state_read(meta)
+        if not ents:
+            break
+        cand = [(k, u) for (k, u) in units_fn() if k in ents]
+        if not cand:
+            break
+        now = time.time()
+        try:
+            due = [u for k, u in cand if float(ents[k].get("retry_after", 0)) <= now]
+        except (TypeError, ValueError):
+            due = [u for k, u in cand]          # unreadable deadline: due now (fail-open)
+        if due:
+            try:
+                sig = (sum(float(e.get("attempts", 0)) for e in ents.values()
+                           if isinstance(e, dict)), len(cand))
+            except (TypeError, ValueError):
+                sig = None
+            redrive(due)
+            if sig is not None and sig == sig_prev:
+                break                            # zero progress: fail open, never spin
+            sig_prev = sig
+            continue
+        try:
+            wait = min(float(ents[k].get("retry_after", 0)) - now for k, u in cand)
+        except (TypeError, ValueError):
+            wait = 0.0
+        _park_wait(meta, min(max(wait, 0.0), 2.0), cancel=cancel)
+    if meta["_stop"].is_set() or (cancel is not None and cancel.is_set()):
+        stragglers = [u for (k, u) in units_fn() if k in _retry_state_read(meta)]
+        if stragglers:
+            redrive(stragglers)
+
+
+def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=True):
     """Q4 transient retry: re-spawn a failed child up to the node's retry.transient
     cap (default 2 — hw-23c tunable 0..8), backoff 5 s / 20 s (run-tunable via
     retry_backoff) ONLY when ALL hold — error_class ∈ {transport, unknown} AND the
@@ -7191,12 +7363,32 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None):
     agrees with the event history (every parked death stays machine-visible).
     The per-node cap and the transport_exhausted demotion count THIS ladder's
     own attempts only; an inherited log alone never demotes a record the
-    ladder never touched."""
+    ladder never touched.
+    est-9ceqc (WF-GRAFT-5): the schedule is EXPONENTIAL (base 2.0 s, ceiling
+    30.0 s, door-overridable via meta retry_policy; rate_limited deaths keep
+    the jam-h22 full-jitter draw) and every re-drive is PERSISTED-then-DEFERRED:
+    the ladder records {attempts, retry_after} to <run>/retry_state.json,
+    returns a `status: "deferred"` sentinel, and the wave/fan-out driver
+    re-drives this unit at the deadline — the worker never sits on the wait.
+    Pass defer=False to keep the in-place re-drive (the consolidate batch cell,
+    which has no driver drain); even there the deadline persists first, so a
+    restart mid-wait is still honored. A resumed entry CONTINUES the persisted
+    attempt count; persisted attempts >= the cap book the fresh death and
+    demote exactly like the in-process give-up. Every draw still bills
+    meta['_retries_left'] (Q4 law intact)."""
     run = meta["_run"]
-    backoff = _retry_conf_params(meta)[0]
-    cap = _retry_caps(node)[0]   # hw-23c: author-tunable (default 2 = today's law)
+    backoff = _retry_conf_params(meta)[0]   # jam-h22: rate-limited jitter law only
+    base, ceiling, _ma = _retry_policy_conf_params(meta)   # est-9ceqc
+    cap = _transient_cap(meta, node)   # hw-23c author key > door policy (est-9ceqc)
     attempts_log = list(r.get("attempts_log") or [])   # est-ja41: inherited park history
-    ladder_attempts = 0
+    # est-9ceqc: a re-driven (possibly restarted) entry CONTINUES the persisted
+    # count — the attempt bound never restarts with the process.
+    key = _retry_state_key(ev_kw)
+    try:
+        seed = int(_retry_state_read(meta).get(key, {}).get("attempts", 0))
+    except (TypeError, ValueError, AttributeError):
+        seed = 0
+    ladder_attempts = seed if seed > 0 else 0
     while (r.get("status") == "failed" and r.get("error_class") in _RETRYABLE_CLASSES
            and ladder_attempts < cap):
         if meta["_stop"].is_set():
@@ -7223,31 +7415,44 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None):
 "error_class": r["error_class"], "at": now(),
                              **_attempt_counts(run, r)})
         ladder_attempts += 1   # est-ja41: THIS ladder's own attempt counter
-        # jam-h22/h30: rate-limited deaths draw full-jitter sleeps (see _retry_sleep);
-        # a false-positive-free retry decision is unchanged — only the delay differs.
+        # jam-h22: rate-limited deaths keep drawing full-jitter sleeps (see
+        # _retry_sleep), indexed by the LADDER's own attempts (est-ja41: never
+        # the merged history). est-9ceqc: every OTHER transient death draws the
+        # exponential persisted schedule — the superseded [5,20] fixed ladder.
         rate_limited = _is_rate_limited(r.get("raw"))
         if rate_limited:
             r["subtype"] = "rate_limited"
-        # est-ja41: the sleep schedule indexes the LADDER's attempts, never the
-        # merged history — an inherited park log must not shift 5 s -> 20 s.
-        delay = _retry_sleep(backoff, ladder_attempts - 1, r.get("raw"))
-        log(run, ev + ".retrying", error_class=r["error_class"], backoff_s=delay,
-            rate_limited=rate_limited,
-            attempts_log=list(attempts_log), **ev_kw)
+            delay = _retry_sleep(backoff, ladder_attempts - 1, r.get("raw"))
+        else:
+            delay = _retry_policy_delay(base, ceiling, ladder_attempts)
+        # est-9ceqc: the machine-wait event keeps its shape (backoff_s) and now
+        # ALSO carries the persisted deadline, so dispatchers read windows from
+        # events exactly as they read them from retry_state.json.
         deadline = time.time() + delay
-        while time.time() < deadline:
-            if meta["_stop"].is_set():
-                break
-            time.sleep(0.1)
-        if meta["_stop"].is_set():
-            break
+        log(run, ev + ".retrying", error_class=r["error_class"], backoff_s=delay,
+            rate_limited=rate_limited, retry_after=round(deadline, 3),
+            attempts_log=list(attempts_log), **ev_kw)
         # #61 quarantine law: attempt N+1 NEVER shares a worktree/workdir with
         # live attempt-N descendants — killpg the prior tree and PROVE it dead
-        # by /proc re-walk before the next Popen, or fail closed typed.
+        # before the next Popen, or fail closed typed. est-9ceqc: the proof
+        # runs BEFORE the window opens, so a deferral never re-spawns over a
+        # tree it never judged.
         iso = _isolate_prior(meta, r, ev, ev_kw)
         if iso is not None:
             iso["attempts_log"] = attempts_log
+            _retry_state_pop(meta, key)
             return iso
+        if defer:
+            _retry_state_put(meta, key, ladder_attempts, deadline,
+                             error_class=r["error_class"])
+            return {"status": "deferred", "error_class": r["error_class"],
+                    "error": r.get("error"), "deferred_until": deadline,
+                    "ms": 0, "skey": r.get("skey")}
+        _retry_state_pop(meta, key)   # defer=False: window consumed by the in-place wait
+        if _park_wait(meta, delay, cancel=cancel) and meta["_stop"].is_set():
+            break
+        if meta["_stop"].is_set():
+            break
         hint = _resume_hint_block(run, node, ev_kw.get("index"), attempts_log)   # #130
         r = respawn(resume_preamble=hint) if hint else respawn()
         # wf159c finding 2: a banner death that surfaces AFTER a ladder
@@ -7264,17 +7469,36 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None):
             return _ratelimit_park(meta, r, respawn, ev, ev_kw,
                                    node=node, cancel=cancel,
                                    prior_attempts_log=attempts_log)
-    if attempts_log:
-        r["attempts_log"] = attempts_log
+    # est-9ceqc: a RESUMED entry whose persisted attempts already reached the
+    # cap arrives with a retryable death and never enters the loop. The bound is
+    # the same law across a restart: book the death, skip the re-drive, and let
+    # the final demote fire exactly like the in-process give-up.
+    if (seed and seed >= cap and r.get("status") == "failed"
+            and r.get("error_class") in _RETRYABLE_CLASSES
+            and not meta["_stop"].is_set()):
+        attempts_log.append({"attempt": len(attempts_log),
+                             "error_class": r["error_class"], "at": now(),
+                             **_attempt_counts(run, r)})
+        log(run, ev + ".retry_skipped",
+            reason="persisted transient attempts exhausted (resumed run)",
+            error_class=r.get("error_class"), **ev_kw)
+    if attempts_log or seed:
+        if attempts_log:
+            r["attempts_log"] = attempts_log
         last_spawn = r.get("spawn")
-        r["attempts"] = last_spawn + 1 if isinstance(last_spawn, int) else len(attempts_log) + r.get("attempts", 0)
+        base_att = (last_spawn + 1 if isinstance(last_spawn, int)
+                    else len(attempts_log) + r.get("attempts", 0))
+        # est-9ceqc: the committed attempt count is the WHOLE lifetime — the
+        # persisted seed plus what this entry spawned.
+        r["attempts"] = seed + base_att if seed else base_att
         # est-ja41: transport_exhausted is the LADDER's own verdict — "this
-        # ladder spent its respawns on the same dead model". An inherited park
+        # ladder spent its respawns on the SAME dead model". An inherited park
         # history proves nothing about this ladder; for no-inherit runs
         # ladder_attempts>=1 reproduces the pre-fix trigger (own log non-empty)
         # exactly, including the blocked-append path.
         if ladder_attempts >= 1 and r.get("error_class") in _RETRYABLE_CLASSES:
             r["error_class"] = "transport_exhausted"
+    _retry_state_pop(meta, key)   # est-9ceqc: terminal exit — no pending window survives it
     return r
 
 def _fallback_ladder(meta, r, respawn_fallback, ev, ev_kw, node=None, cancel=None):
@@ -7969,7 +8193,8 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                             rb = _transient_retry(meta, _bs(), _bs, "consolidate.batch",
                                                   {"node": nid, "partner": cons_partner["id"],
                                                    "batch": b},
-                                                  node=cons_partner, cancel=meta["_stop"])
+                                                  node=cons_partner, cancel=meta["_stop"],
+                                                  defer=False)   # est-9ceqc: cell batch keeps the in-place re-drive (no driver drain); the deadline still persists
                             rb = _bounded_retry_tuned(meta, rb, _bs, "consolidate.batch",
                                                       {"node": nid, "partner": cons_partner["id"],
                                                        "batch": b},
@@ -8154,6 +8379,13 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                     if meta["_stop"].is_set() or fo_cancel.is_set():
                         return {"status": "failed", "error": "cancelled at quorum",
                                 "error_class": "cancelled", "ms": 0}
+                    # est-9ceqc restart law: a persisted window that is still
+                    # open defers this item (worker slot released, no spawn
+                    # before the deadline); stop/quorum above already booked
+                    # their established shapes, so the gates keep priority.
+                    if _retry_window_open(meta, "%s#%d" % (nid, i)):
+                        return {"status": "deferred", "error_class": "deferred_window",
+                                "error": "persisted transient-retry window open", "ms": 0}
                     # 790c6ad ADOPT-NOT-RESPAWN: on a resumed runner the item's
                     # spawn record may describe a child the dead runner left
                     # RUNNING. If wfcommon.active_child verifies it (status=running
@@ -8192,8 +8424,12 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                     r = _ratelimit_park(meta, spawn(), spawn, "item",   # est-t0vz
                                         {"node": nid, "index": i}, node=node,
                                         cancel=fo_cancel)                  # wf159c finding 3
+                    if r.get("status") == "deferred":
+                        return   # est-9ceqc: window open — slot released; the fan-out drain re-drives
                     r = _transient_retry(meta, r, spawn, "item", {"node": nid, "index": i},
                                          node=node, cancel=fo_cancel)
+                    if r.get("status") == "deferred":
+                        return   # est-9ceqc: persisted window just opened — slot released
                     r = _fallback_ladder(meta, r,
                                          lambda m, rp="": spawn(rp, model_override=m),
                                          "item", {"node": nid, "index": i},
@@ -8270,6 +8506,18 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
             try:
                 with ThreadPoolExecutor(max_workers=cap) as ex:
                     list(ex.map(lambda t: one(*t), list(enumerate(items))))
+                    # est-9ceqc: items whose transient retry DEFERRED returned
+                    # their slot instantly; re-drive each as its persisted
+                    # deadline passes. The drain's idle is driver-thread-only
+                    # (no pool worker is in flight here) and observes stop +
+                    # quorum cancel; a deferred straggler at quorum commits
+                    # the established cancelled shape via _spawn's gates.
+                    def _fo_deferred_units():
+                        return [("%s#%d" % (nid, j), (j, items[j]))
+                                for j in range(len(items)) if results[j] is None]
+                    _retry_drain(meta, _fo_deferred_units,
+                                 lambda us: list(ex.map(lambda t: one(*t), us)),
+                                 cancel=fo_cancel)
             finally:
                 strag_stop.set()
             # est-fanout-cell: the wave ends -> the open batch ALWAYS flushes with
@@ -8397,6 +8645,16 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
         else:
             first = {"done": False}
             def spawn(resume_preamble="", model_override=None):
+                # est-9ceqc restart law: a persisted window that is still open
+                # defers the worker (slot released, nothing billed); a stop
+                # during the window books the established cancelled shape.
+                if _retry_window_open(meta, str(nid)):
+                    if meta["_stop"].is_set():
+                        return {"status": "failed",
+                                "error": "stopped during a persisted transient-retry window",
+                                "error_class": "cancelled", "ms": 0}
+                    return {"status": "deferred", "error_class": "deferred_window",
+                            "error": "persisted transient-retry window open", "ms": 0}
                 sk = solo_key if not first["done"] else skey_for(run, byid, node)
                 first["done"] = True
                 detached = _poll_registered_job(meta, node, byid)
@@ -8406,7 +8664,11 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                                  node.get("schema"), steering=steering, skey=sk, inputs=inputs_txt,
                                  resume_preamble=resume_preamble, model_override=model_override)
             r = _ratelimit_park(meta, spawn(), spawn, "node", {"node": nid}, node=node)  # est-t0vz
+            if r.get("status") == "deferred":
+                return   # est-9ceqc: window open — slot released; the wave drain re-drives
             r = _transient_retry(meta, r, spawn, "node", {"node": nid}, node=node)
+            if r.get("status") == "deferred":
+                return   # est-9ceqc: persisted window just opened — slot released
             r = _fallback_ladder(meta, r, lambda m, rp="": spawn(rp, model_override=m),
                                  "node", {"node": nid}, node=node)   # est-2ek.1.164
             r = _bounded_retry_tuned(meta, r, spawn, "node", {"node": nid}, node=node)
@@ -9177,6 +9439,7 @@ def main(run_id):
     meta["_procs"] = {}
     meta["_procs_lock"] = threading.Lock()
     meta["_stop"] = threading.Event()
+    meta["_retry_state_lock"] = threading.Lock()   # est-9ceqc: retry_state.json writer lock
     # Continuous zombie hygiene (BELOW the meta init it reads): subreaper
     # adoption means every double-fork descendant that dies lands in THIS
     # process's child table; boot-sweep-only reaping let healthy lanes
@@ -9617,8 +9880,20 @@ def main(run_id):
                 spawnable.append(n)
             if spawnable:
                 with ThreadPoolExecutor(max_workers=meta.get("concurrency", 4)) as ex:
-                    list(ex.map(lambda n: run_agent_node(run, meta, rs.byid, n, outputs,
-                                                         steering.pop(n["id"], None) or []), spawnable))
+                    _wave_map = lambda ns: list(
+                        ex.map(lambda n: run_agent_node(run, meta, rs.byid, n, outputs,
+                                                        steering.pop(n["id"], None) or []), ns))
+                    _wave_map(spawnable)
+                    # est-9ceqc: solo nodes whose worker DEFERRED on a persisted
+                    # transient window returned without a record; re-drive each
+                    # at its deadline. Fan-out nodes are NOT drained here — the
+                    # key of an item window is `node#index`, so the wave-level
+                    # units (plain node ids) never match them; the fan-out's own
+                    # drain re-drove its items before the aggregate committed.
+                    _retry_drain(meta,
+                                 lambda: [(n["id"], n) for n in spawnable
+                                          if not (run / "nodes" / ("%s.json" % n["id"])).exists()],
+                                 _wave_map)
             continue  # top of loop: consume markers, recompute states
 
         m = consume_markers()
