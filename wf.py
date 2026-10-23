@@ -7264,12 +7264,16 @@ def _retry_state_lock(meta):
     return meta.setdefault("_retry_state_lock", threading.Lock())
 
 
-def _retry_state_put(meta, key, attempts, retry_after, error_class=None):
+def _retry_state_put(meta, key, attempts, retry_after, error_class=None, log=None):
     with _retry_state_lock(meta):
         ents = _retry_state_read(meta)
         ent = {"attempts": int(attempts), "retry_after": float(retry_after)}
         if error_class:
             ent["last_error_class"] = str(error_class)
+        if log:   # est-9ceqc: the deferred pass discards its record; carry the
+            # ladder/park history forward so the terminal commit stays honest.
+            ent["log"] = [{"attempt": e.get("attempt"), "error_class": e.get("error_class"),
+                           "at": e.get("at")} for e in list(log)[-8:]]
         ents[str(key)] = ent
         _retry_state_write(meta, ents)
 

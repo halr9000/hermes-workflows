@@ -111,7 +111,7 @@ try:
     def spawn2():
         return next(seq2)
     r2 = _wfmod._transient_retry(m, spawn2(), spawn2, "node", {"node": "x"},
-                                 node={"timeout": 30})
+                                 node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
     # The inherited shape is what the REAL pipeline feeds the ladder: the park's
     # record with attempts_log attached. Drive that exact input:
     r_in = transport_r()
@@ -120,7 +120,7 @@ try:
     def spawn3():
         return next(seq3)
     r3 = _wfmod._transient_retry(m, r_in, spawn3, "node", {"node": "x"},
-                                 node={"timeout": 30})
+                                 node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
     log_cls = [a.get("error_class") for a in (r3.get("attempts_log") or [])]
     # The loop logs the death BEFORE each respawn (pre-fix law), so this shape
     # holds the park's death + the entry logged pre-respawn + the entry logged
@@ -136,7 +136,7 @@ try:
     def spawn4():
         return next(seq4)
     r4 = _wfmod._transient_retry(m, spawn4(), spawn4, "node", {"node": "x"},
-                                 node={"timeout": 30})
+                                 node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
     check("A2: no-inherit run logs ONLY its own transport attempt (pre-fix byte shape)",
           [a.get("error_class") for a in (r4.get("attempts_log") or [])] == ["transport"]
           and r4.get("status") == "done",
@@ -159,7 +159,7 @@ try:
         r_in2 = transport_r()
         r_in2["attempts_log"] = [{"attempt": 0, "error_class": "ratelimit", "at": "t0"}]
         r5 = _wfmod._transient_retry(m_pos, r_in2, lambda: transport_r(), "node",
-                                     {"node": "x"}, node={"timeout": 30})
+                                     {"node": "x"}, node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
         check("A3: transport death, inherited log present, ladder never acted -> class stays transport",
               r5.get("error_class") == "transport", str(r5.get("error_class")))
     finally:
@@ -174,7 +174,7 @@ try:
     def spawn6():
         return next(seq6)
     r6 = _wfmod._transient_retry(m6, r_in3, spawn6, "node", {"node": "x"},
-                                 node={"timeout": 30})
+                                 node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
     # Q4 law: AT MOST 2 respawns — the loop logs the death before each respawn,
     # so a fully-spent ladder holds exactly 2 own entries, then the third death
     # exits and the verdict demotes.
@@ -193,7 +193,7 @@ try:
     def spawn7():
         return next(seq7)
     r7 = _wfmod._transient_retry(m, r_in4, spawn7, "node", {"node": "x"},
-                                 node={"timeout": 30})
+                                 node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
     check("A5: inherited history + exhausted own ladder -> transport_exhausted (park history survives the demote)",
           r7.get("error_class") == "transport_exhausted"
           and [a.get("error_class") for a in (r7.get("attempts_log") or [])]

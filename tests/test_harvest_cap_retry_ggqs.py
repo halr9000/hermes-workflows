@@ -253,7 +253,7 @@ def transient(r, respawn, api_calls=0):
     engine._retry_sleep = lambda *_a, **_k: 0.0
     engine.log = lambda _run, ev, **kw: seen.append((ev, kw))
     try:
-        out = engine._transient_retry(meta, r, respawn, "node", {"node": "plan"})
+        out = engine._transient_retry(meta, r, respawn, "node", {"node": "plan"}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
     finally:
         engine._attempt_api_calls, engine._retry_sleep, engine.log = orig
     return out, meta, seen

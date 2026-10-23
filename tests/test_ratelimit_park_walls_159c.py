@@ -185,7 +185,7 @@ try:
             calls.append(1); return L.spawn()
         m2 = dict(m); m2["_retries_left"] = 3
         r = _wfmod._transient_retry(m2, L.spawn(), respawn_late, "node", {"node": "x"},
-                                    node={"timeout": 30})
+                                    node={"timeout": 30}, defer=False)  # est-9ceqc: in-place mode — this test owns the park/history handoff, not the defer law
         check("B2 unit: transport->respawn->banner parks under the SAME budget; the park owns "
               "the terminal word, banner truth survives (no zero-park transport terminal)",
               r.get("error_class") == "ratelimit"
