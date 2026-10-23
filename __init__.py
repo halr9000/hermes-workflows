@@ -293,6 +293,30 @@ def _retry_bake(args):
             baked["retry_budget"] = v
         else:
             return None, {"error": "retry_budget must be a non-negative integer"}
+    if "retry_policy" in args:   # est-9ceqc WF-GRAFT-5: persisted transient-retry policy
+        v = args["retry_policy"]
+        if isinstance(v, dict) and set(v) <= {"max_attempts", "base_seconds", "ceiling_seconds"}:
+            out = {}
+            if "max_attempts" in v:
+                ma = v["max_attempts"]
+                if type(ma) is int and 1 <= ma <= 9:
+                    out["max_attempts"] = ma
+                else:
+                    return None, {"error": "retry_policy.max_attempts must be an integer "
+                                           "1..9 (TOTAL attempts, default 3)"}
+            for k, hi in (("base_seconds", 300.0), ("ceiling_seconds", 600.0)):
+                if k in v:
+                    x = v[k]
+                    if type(x) in (int, float) and not isinstance(x, bool) \
+                            and 0 <= float(x) <= hi:
+                        out[k] = float(x)
+                    else:
+                        return None, {"error": "retry_policy.%s must be a number in [0, %g]"
+                                            % (k, hi)}
+            baked["retry_policy"] = out
+        else:
+            return None, {"error": "retry_policy must be an object carrying only "
+                                   "max_attempts / base_seconds / ceiling_seconds"}
     return baked, None
 
 
@@ -771,6 +795,7 @@ WORKFLOW_PARAMS = {
         "from": {"type": "string", "description": "run: library graph name to replay (instead of graph or graph_path)."},
         "retry_backoff": {"type": "array", "items": {"type": "number"}, "description": "run only: two non-negative seconds [first, second] replacing the transient ladder's retry schedule (default [5, 20]). The runner reads them from run.json meta; the node-level `retry` key caps attempts."},
         "retry_budget": {"type": "integer", "description": "run only: non-negative cap on total retry draws across ALL ladders for the run (default 6). A storm beyond the budget fails typed retry_skipped, never silently retries on."},
+        "retry_policy": {"type": "object", "description": "run only: replace the transient ladder's PERSISTED retry policy — {max_attempts int 1..9 (TOTAL attempts, default 3), base_seconds 0..300 (default 2.0), ceiling_seconds 0..600 (default 30.0)}; the wait before re-spawn n is min(base*2**(n-1), ceiling) and the deadline persists to the run dir (retry_state.json): the ladder defers instead of sleeping, and a runner restarted mid-window honors the window before spawning. Door-meta channel like retry_backoff (superseded there for the transient schedule); an explicit node retry.transient key still caps that node's re-spawns."},
         "run_context": {"type": ["string", "object"], "description": "run only: non-empty string seed appended to every first-wave agent (including agents behind gate-only paths), OR non-empty map of identifier keys to non-empty strings replacing only explicit {run.KEY} in node goals/contexts, agent repo lanes, fan-out goals/item goals and gate questions. Library-sourced launches also render profile, echo string output, gate options and wait.until_argv; every surviving ref refuses before any write. Inline argv retains its existing unbound-placeholder refusal. Missing keys/malformed bindings reject before any run write — as does a seed against a graph with {run.KEY} refs, or a JSON-encoded map passed as a string. Values are persisted in prompts; do not supply secrets. A seed cannot replace baked literals. A graph may declare its binding contract as the graph-level run_context key {required:[KEY...], defaults:{KEY:val}} — a missing required key rejects before any run write with error_type missing_run_context_keys."},
         "description": {"type": "string", "description": "save: one-line purpose shown by library/list."},
         "params": {"type": "object", "additionalProperties": {"type": "object"}, "description": "save: optional meta.params descriptions/default suggestions for run_context keys. Required keys derive from graph refs, never this metadata. Omission retains prior params; {} deliberately clears them. Missing/dead declarations warn, never prevent saving."},

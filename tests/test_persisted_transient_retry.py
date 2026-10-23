@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -80,6 +81,7 @@ STOP = threading.Event()
 
 def mk_meta(td, extra=None):
     run = Path(td)
+    run.mkdir(parents=True, exist_ok=True)
     (run / "nodes").mkdir(exist_ok=True)
     m = {"_run": run, "_stop": STOP, "_procs_lock": threading.Lock(),
          "_retries_left": 50, "_retry_state_lock": threading.Lock()}
@@ -230,7 +232,10 @@ if HAVE_API:
         (Path(td) / "retry_state.json").unlink(missing_ok=True)
         check("absent state file reads as no window",
               wf._retry_state_read(meta) == {}
-              and wf._retry_window_open(meta, "solo") is False)
+              and wf._retry_window_open(meta, "solo") is False,
+              (wf._retry_state_read(meta),
+               wf._retry_window_open(meta, "solo"),
+               (Path(td) / "retry_state.json").exists()))
 
         # ---------- 7. retry_budget law STAYS: persisted attempts draw the budget ----------
         meta = mk_meta(td + "e", {"retry_policy": {"base_seconds": 0.05,
@@ -248,8 +253,10 @@ if HAVE_API:
         r2 = wf._transient_retry(meta2, death(), never_spawn(), "node",
                                  {"node": "nobudget"},
                                  node={"id": "nobudget", "type": "agent", "goal": "g"})
-        check("exhausted Q4 budget blocks the window (no deferral, honest death)",
-              r2.get("status") == "failed" and r2.get("error_class") == "transport"
+        check("exhausted Q4 budget blocks the window (no deferral; the blocked "
+              "path keeps its pre-existing transport_exhausted demote law)",
+              r2.get("status") == "failed"
+              and r2.get("error_class") == "transport_exhausted"
               and wf._retry_state_read(meta2).get("nobudget") is None, r2)
 
     # ---------- 8. fan-out item keying: (node,index) keeps its own window ----------
