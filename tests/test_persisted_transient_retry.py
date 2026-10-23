@@ -221,21 +221,24 @@ if HAVE_API:
               and rfin.get("attempts") == 2, (seq, rfin))
 
         # ---------- 6. corrupt / absent state = fail-open ----------
-        (Path(td) / "retry_state.json").write_text("{not json at all")
-        r = wf._transient_retry(meta, death(), never_spawn(), "node",
+        meta6 = mk_meta(td + "g", {"retry_policy": {"base_seconds": 0.05,
+                                                    "ceiling_seconds": 1.0,
+                                                    "max_attempts": 4}})
+        (Path(td + "g") / "retry_state.json").write_text("{not json at all")
+        r = wf._transient_retry(meta6, death(), never_spawn(), "node",
                                 {"node": "solo"},
                                 node={"id": "solo", "type": "agent", "goal": "g"})
         check("corrupt state file FAILS OPEN to a fresh deferral (no crash, no seed)",
               r.get("status") == "deferred"
-              and (wf._retry_state_read(meta).get("solo") or {}).get("attempts") == 1,
+              and (wf._retry_state_read(meta6).get("solo") or {}).get("attempts") == 1,
               r)
-        (Path(td) / "retry_state.json").unlink(missing_ok=True)
+        (Path(td + "g") / "retry_state.json").unlink(missing_ok=True)
         check("absent state file reads as no window",
-              wf._retry_state_read(meta) == {}
-              and wf._retry_window_open(meta, "solo") is False,
-              (wf._retry_state_read(meta),
-               wf._retry_window_open(meta, "solo"),
-               (Path(td) / "retry_state.json").exists()))
+              wf._retry_state_read(meta6) == {}
+              and wf._retry_window_open(meta6, "solo") is False,
+              (wf._retry_state_read(meta6),
+               wf._retry_window_open(meta6, "solo"),
+               (Path(td + "g") / "retry_state.json").exists()))
 
         # ---------- 7. retry_budget law STAYS: persisted attempts draw the budget ----------
         meta = mk_meta(td + "e", {"retry_policy": {"base_seconds": 0.05,
@@ -314,7 +317,7 @@ if HAVE_API:
             time.sleep(0.02)
         return False
 
-    FAKE = str(HERE / "fake_hermes.py")
+    FAKE = str(HERE / "fake")   # executable shim forwarding to fake_hermes.py
 
     def integration_env(td, goal, fails):
         runs = Path(td) / "runs"
@@ -326,6 +329,7 @@ if HAVE_API:
                "HERMES_WF_HERMES_BIN": FAKE,
                "FAKE_MODE": "transient_counted",
                "FAKE_TRANSIENT_FAILS": str(fails),
+               "FAKE_API_CALLS": "0",   # dead attempt made ZERO api calls: replay-safe
                "FAKE_ATTEMPT_DIR": str(att)}
         return runs, att, env
 
@@ -339,7 +343,7 @@ if HAVE_API:
         runs, att, env = integration_env(td3, "PTT-RESTART-A", 2)
         graph = {"name": "ptt-restart",
                  "nodes": [{"id": "a", "type": "agent", "goal": "PTT-RESTART-A"}]}
-        with __import__("unittest.mock").patch.dict(os.environ, env, clear=False):
+        with patch.dict(os.environ, env, clear=False):
             start = door.act_run({"graph": graph, "lane_key": "ptt/restart-a",
                                   "retry_policy": BASE3})
             check("integration: run started", "run_id" in start, start)
@@ -408,7 +412,7 @@ if HAVE_API:
         runs, att, env = integration_env(td4, "PTT-BOUND-B", 99)
         graph = {"name": "ptt-bound",
                  "nodes": [{"id": "a", "type": "agent", "goal": "PTT-BOUND-B"}]}
-        with __import__("unittest.mock").patch.dict(os.environ, env, clear=False):
+        with patch.dict(os.environ, env, clear=False):
             start = door.act_run({"graph": graph, "lane_key": "ptt/bound-b",
                                   "retry_policy": BASE3})
             rid = start["run_id"]
@@ -435,7 +439,7 @@ if HAVE_API:
         runs, att, env = integration_env(td5, "PTT-CAP-C", 99)
         graph = {"name": "ptt-cap",
                  "nodes": [{"id": "a", "type": "agent", "goal": "PTT-CAP-C"}]}
-        with __import__("unittest.mock").patch.dict(os.environ, env, clear=False):
+        with patch.dict(os.environ, env, clear=False):
             start = door.act_run({"graph": graph, "lane_key": "ptt/cap-c",
                                   "retry_policy": BASE3})
             rid = start["run_id"]
