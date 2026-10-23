@@ -9815,6 +9815,7 @@ def main(run_id):
             ready = []
         if ready:
             spawnable = []
+            held = []                             # est-9ceqc: units inside an open persisted window
             for n in ready:
                 # est-2ek.1.603: the publisher gate is checked BEFORE any Popen —
                 # a declared publisher without a verified suite proof token dies
@@ -9884,8 +9885,20 @@ def main(run_id):
                             log(run, "agent.skipped", node=n["id"], mode="prune")
                             states[n["id"]] = "skipped"
                         continue
+                if _retry_window_open(meta, n["id"]):
+                    # est-9ceqc: this unit DEFERRED on a persisted transient
+                    # window — it is HELD out of this wave. Re-dispatching a
+                    # held unit every tick would log node.started with no spawn
+                    # behind it (an event lie) and spin the loop; the drain
+                    # below re-drives it exactly at its deadline. Fan-out
+                    # windows key `node#index` — not held at this seam; the
+                    # fan-out's own drain re-drove its items before aggregate
+                    # commit, and a mid-item wave replay re-enters the per-item
+                    # guards, which defer without drawing budget or death.
+                    held.append(n)
+                    continue
                 spawnable.append(n)
-            if spawnable:
+            if spawnable or held:
                 with ThreadPoolExecutor(max_workers=meta.get("concurrency", 4)) as ex:
                     _wave_map = lambda ns: list(
                         ex.map(lambda n: run_agent_node(run, meta, rs.byid, n, outputs,
@@ -9898,7 +9911,7 @@ def main(run_id):
                     # units (plain node ids) never match them; the fan-out's own
                     # drain re-drove its items before the aggregate committed.
                     _retry_drain(meta,
-                                 lambda: [(n["id"], n) for n in spawnable
+                                 lambda: [(n["id"], n) for n in spawnable + held
                                           if not (run / "nodes" / ("%s.json" % n["id"])).exists()],
                                  _wave_map)
             continue  # top of loop: consume markers, recompute states
