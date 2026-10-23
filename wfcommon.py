@@ -842,7 +842,14 @@ AGENT_KEYS = {"id", "type", "after", "goal", "context", "schema", "model", "prov
               # slice that wires the loop replaces the refusal with the real thing;
               # until then a pack can express the shape and get a typed refusal, not a
               # silent degradation to exit-and-relaunch.
-              "rework"}
+              "rework",
+              # WF-GRAFT-1 (est-1f7cn): wake-noise tier for this node — `full` |
+              # `quiet` | `silent`, overriding the graph-level `wake_tier` default.
+              # It governs ONLY the notices whose subject is this node (its fan-out's
+              # stragglers observation, this gate's own hold); run-terminal wakes
+              # never consult it. Enforced in wf._wake_suppression; the law lives in
+              # references/grammar.md.
+              "wake_tier"}
 RETRY_BOUNDS = {"transient": 8, "bounded": 8}   # hw-23c: author ceiling per half
 RETRY_DEFAULTS = {"transient": 2, "bounded": 1}  # today's hardcoded law
 
@@ -869,6 +876,17 @@ def _retry_block_errors(v, field):
 
 
 HARVEST_POLICIES = ("strict", "validate")   # est-ggqs: agent `harvest_policy` values
+# WF-GRAFT-1 (est-1f7cn): the closed wake-noise tier ladder, legal at graph top level
+# (the default) and on agent/gate nodes (the override). The ladder is ordered by how
+# much the owner is NOT woken, and the floor is fixed by law, not by value:
+#   full   — every notice whose subject is the node wakes (today's behavior).
+#   quiet  — the node's mid-flight OBSERVATIONS (fanout.stragglers) are recorded in
+#            the probe instead of waking; a hold and every run-terminal notice still
+#            wakes.
+#   silent — every node-SUBJECT notice (including this gate's own hold, which the
+#            author then owns polling) is recorded, not woken.
+# No tier governs run.done / run.failed / run.partial — see wf._TIERED_WAKE_EVENTS.
+WAKE_TIERS = ("full", "quiet", "silent")
 GATE_KEYS = {"id", "type", "after", "question", "options", "context", "when", "wait", "on_skip",
              "default_option", "hold_timeout",
              # est-bwv0h: door-time parameter seam — presence gate + conditional patch
@@ -878,7 +896,11 @@ GATE_KEYS = {"id", "type", "after", "question", "options", "context", "when", "w
              "requires", "after_partial", "order_only",
              # est-2ek.1.603: a gate may DECLARE a suite-proof producer (the token is
              # minted on its committed answer); it can never declare itself a publisher.
-             "suite_proof"}
+             "suite_proof",
+             # WF-GRAFT-1: a gate's own tier governs whether ITS hold wakes the owner
+             # (`silent` = the author owns polling it; `quiet` deliberately does NOT
+             # silence a hold — a held gate asks for an action, not an observation).
+             "wake_tier"}
 ECHO_KEYS = {"id", "type", "after", "output",
              # est-bwv0h: door-time parameter seam (see GATE_KEYS).
              "where", "by",
@@ -1592,6 +1614,20 @@ def validate_graph_errors(nodes, *, admission=False):
             elif not isinstance(n["after_partial"], bool):
                 E(nid, "after_partial", "after_partial must be a boolean "
                                         "(true = this node consumes a partial ancestor's harvest)")
+        if "wake_tier" in n:
+            # WF-GRAFT-1 (est-1f7cn): closed value set (agent/gate only — an echo
+            # carries no node-subject notice, so the closed key set already refuses it
+            # by name above). A tier is policy over WAKES only; it never touches
+            # scheduling, and it can never govern a run-terminal wake.
+            wt = n["wake_tier"]
+            if not isinstance(wt, str) or wt not in WAKE_TIERS:
+                E(nid, "wake_tier", f"wake_tier {wt!r} invalid: must be one of "
+                                    + json.dumps(list(WAKE_TIERS))
+                                    + " (full = every notice about this node wakes; "
+                                      "quiet = its fan-out straggler observation "
+                                      "records without waking; silent = its "
+                                      "node-subject notices record, including this "
+                                      "gate's own hold)")
         if "harvest_policy" in n:
             # est-ggqs: closed value set; a fan-out aggregate already merges harvest
             # credit (partial items count done), so the key means nothing there —
@@ -2360,6 +2396,11 @@ STRUCTURAL_GRAPH_KEYS = {"name", "nodes", "description", "defaults", "model_poli
                          "requires_plugin",
                          # est-2ek.1.158: the node whose output IS the run verdict.
                          "result", "on_exit",
+                         # WF-GRAFT-1 (est-1f7cn): the graph-wide wake-noise DEFAULT
+                         # ("full" | "quiet" | "silent"); a node's own `wake_tier`
+                         # overrides it. Validated by value below; honored by
+                         # wf._wake_suppression at the notify seam.
+                         "wake_tier",
                          # #126 (est-syim): machine-readable {run.KEY} binding contract —
                          # {required?: [ids], defaults?: {id: non-empty str}}; shape
                          # validated here (run_context_contract_errors), enforced at run
@@ -2395,6 +2436,10 @@ GRAPH_KEY_MIN_VERSION = {
     "on_exit": "1.3.7",
     "budget": "1.3.9", "max_seats": "1.3.9",
     "params": "1.4.0", "run_context": "1.4.0",
+    # WF-GRAFT-1: wake-noise tiers. Floor is the next feature release (never earlier
+    # than proven — a 1.3.x door genuinely refuses this key, so the hint a stale door
+    # prints stays upgrade-sufficient).
+    "wake_tier": "1.4.0",
 }
 
 # The truth of THIS module — what this process loaded. plugin_version() above
@@ -2952,6 +2997,19 @@ def structural_graph_errors(graph, extra_keys=()):
         E(e_["field"], e_["msg"])
     for e_ in result_errors(graph) + on_exit_errors(graph):
         E(e_["field"], e_["msg"])
+    # WF-GRAFT-1 (est-1f7cn): the graph-wide wake default is a closed value, refused
+    # by name at the door — never a silent degradation to a louder or quieter default
+    # (the runner's own read fails open to `full`, so an unvalidated value would wake
+    # differently than the author wrote).
+    if "wake_tier" in graph:
+        _wt = graph["wake_tier"]
+        if not isinstance(_wt, str) or _wt not in WAKE_TIERS:
+            E("wake_tier", f"wake_tier {_wt!r} invalid: must be one of "
+                           + json.dumps(list(WAKE_TIERS))
+                           + " (full = wake on every notice about a node; quiet = that "
+                             "node's straggler observation records without waking; "
+                             "silent = its node-subject notices record, including a "
+                             "gate's own hold). Run-terminal wakes are never tiered.")
     for e_ in run_context_contract_errors(graph):
         E(e_["field"], e_["msg"])
     for e_ in params_errors(graph):

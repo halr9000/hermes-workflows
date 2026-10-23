@@ -642,6 +642,127 @@ def _wake_owner_text(run_id, event, run_dir=None, failed_node_logs=None):
     return (f"[runner-authored/v1] run_id={json.dumps(str(run_id))} "
             f"event={json.dumps(event)}{pointers} \u2014 {body}")
 
+# ---------- wake-noise control: [SILENT] verdict + per-node wake tiers (WF-GRAFT-1) ----------
+# Adapted from itechmeat/hermes-workflows (notifications.py:29-45, engine.py:934-936):
+# a settled result that says "nothing to report" costs the owner ZERO turns, and a
+# scheduled graph can say so per node without changing the graph-wide default.
+#
+# The Hermes `[SILENT]` convention is honored at exactly ONE seam — the run-result
+# wake — and only against the output the graph itself declares as its verdict
+# (top-level `result:`, est-2ek.1.158). Binding the marker to that one committed
+# record is what keeps it safe: any node's prose could otherwise swallow a
+# transition, whereas `result` names the single channel the AUTHOR designated as the
+# run's answer. Case-sensitive, matching the host convention.
+SILENT_MARKER = "[SILENT]"
+
+# The node-subject notices a wake tier may govern. Run-terminal wakes (run.done /
+# run.failed / run.partial) are deliberately NOT tier-governable: the run boundary is
+# the contract that makes `wait` unnecessary, and the only thing that may suppress a
+# run.done wake is the run's own declared verdict carrying SILENT_MARKER. A malformed
+# or optimistic tier can therefore never leave a run unreported at its boundary.
+_TIERED_WAKE_EVENTS = frozenset({"gate.held", "fanout.stragglers"})
+WAKE_TIER_DEFAULT = "full"
+
+
+def _wake_graph(run, graph):
+    """The graph facts the wake-noise read uses: the caller's when it carries nodes,
+    else the run's COMMITTED graph.json (the same on-disk fact the wake identity's
+    fingerprint read rides). Unreadable/garbage degrades to {} — the default
+    behavior, never a crash and never a suppression."""
+    if isinstance(graph, dict) and isinstance(graph.get("nodes"), list) and graph["nodes"]:
+        return graph
+    try:
+        g = jload(run / "graph.json", {}) or {}
+    except Exception:
+        return {}
+    return g if isinstance(g, dict) else {}
+
+
+def _run_result_output(run, graph=None):
+    """The run's COMMITTED verdict output as text — the output of the node the graph
+    names as top-level `result` — or None when there is nothing grounded to read.
+    The `result` id is read from the run's COMMITTED graph.json (the notify call site
+    for run.done passes a run_state-derived graph carrying only `nodes`, so a
+    suppression must never depend on what the caller happened to hand over); the node
+    set comes from the caller's graph when it carries one, else the same file.
+    None — i.e. WAKE NORMALLY — for: no `result` declaration, no committed record, a
+    record the efp law says is stale (node_rec returning `pending`: the same validity
+    law the wake identity and the #501 pointers use), or a commit whose status is not
+    a real commit. Fail-open by construction: a suppression never rests on an
+    unreadable or amended-away fact. A structured (schema-committed) verdict is read
+    whole via JSON so the marker counts anywhere in the author's own answer, not only
+    in a bare-string one."""
+    try:
+        committed = jload(run / "graph.json", {}) or {}
+        committed = committed if isinstance(committed, dict) else {}
+        rid = committed.get("result")
+        if not isinstance(rid, str) or not rid:
+            return None
+        g = _wake_graph(run, graph)
+        byid = {n["id"]: n for n in (g.get("nodes") or [])
+                if isinstance(n, dict) and n.get("id")}
+        if rid not in byid:                       # the caller handed a nodes-only
+            byid = {n["id"]: n for n in (committed.get("nodes") or [])   # projection
+                    if isinstance(n, dict) and n.get("id")}
+        node = byid.get(rid)
+        if not isinstance(node, dict):
+            return None
+        status, rec = node_rec(run, node, byid)
+        if status not in ("done", "partial"):
+            return None                      # stale/amended-away/absent: not a fact
+        if not isinstance(rec, dict) or rec.get("output") is None:
+            return None
+        out = rec["output"]
+        return out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+    except Exception:
+        return None
+
+
+def _wake_tier(run, graph, node_id):
+    """The effective wake tier for one node: the NODE's `wake_tier` over the GRAPH's
+    top-level `wake_tier` default, else `full`. Anything the door would have refused
+    — a non-string, a value outside wfcommon.WAKE_TIERS, an unreadable graph, an
+    unknown node — reads as `full`: the fail-open direction for a wake is always the
+    loud one, so a malformed tier can over-wake and can never swallow a transition."""
+    try:
+        g = _wake_graph(run, graph)
+        tier = None
+        for n in g.get("nodes") or []:
+            if isinstance(n, dict) and n.get("id") == node_id and "wake_tier" in n:
+                tier = n["wake_tier"]
+                break
+        if tier is None:
+            tier = g.get("wake_tier")
+        return tier if tier in wfcommon.WAKE_TIERS else WAKE_TIER_DEFAULT
+    except Exception:
+        return WAKE_TIER_DEFAULT
+
+
+def _wake_suppression(run, event, node, graph):
+    """Why this wake instance must NOT reach the owner session, or None to deliver.
+    Checked BEFORE any POST and before the row would record a delivery attempt: a
+    suppression is a decision, not a transport failure, and it never re-arms.
+      * `silent_marker` — a `run.done` whose declared verdict output carries
+        [SILENT]: the worker said nothing to report. Lifecycle notices
+        (run.failed / run.partial / gate.held / fanout.stragglers) never consult it.
+      * `wake_tier:quiet` — a mid-flight `fanout.stragglers` observation for a node
+        at tier quiet or silent (an observation, not a state the owner must act on).
+      * `wake_tier:silent` — any node-subject notice, including this gate's own hold:
+        the author explicitly took over polling it (status still answers
+        `next: [release]`, and the desktop card still shows the question)."""
+    if event == "run.done":
+        verdict = _run_result_output(run, graph)
+        if verdict is not None and SILENT_MARKER in verdict:
+            return "silent_marker"
+    if node is not None and event in _TIERED_WAKE_EVENTS:
+        tier = _wake_tier(run, graph, node)
+        if tier == "silent":
+            return "wake_tier:silent"
+        if tier == "quiet" and event == "fanout.stragglers":
+            return "wake_tier:quiet"
+    return None
+
+
 _CRASH_GEN: list = [None, None]  # [run_path, generation] for this runner process
 
 # ---------- #8 item 3: crash-respawn idempotence (attempt-N preamble +
@@ -1107,7 +1228,7 @@ def _wake_tid(run_name, event, disc):
         return _ob.instance_id(run_name, event, disc)
     return hashlib.sha256(f"{run_name}\0{event}\0{disc}".encode()).hexdigest()[:32]
 
-def notify(run, event, key=None, graph=None):
+def notify(run, event, key=None, graph=None, node=None):
     """Push ONE lifecycle transition instance to the owner session stamp. Owner-null
     (tests, CLI, tool hosts without a session env) writes NOTHING — the door's
     silent degradation, unchanged. The transition instance (B3 law) is a
@@ -1132,7 +1253,20 @@ def notify(run, event, key=None, graph=None):
     already decided; a dead endpoint must not cost the run its exit. Nothing
     caller-computed is interpolated into the probe before the generic fail-open
     net; a crash in preparation records a typed line. Every persisted field is
-    bearer-redacted (F4) — a stdlib error can embed the raw header value."""
+    bearer-redacted (F4) — a stdlib error can embed the raw header value.
+
+    `node` names the node a NODE-SUBJECT notice is about (the fan-out carrying
+    stragglers, the gate that is holding) so the wake-noise law can read THAT
+    node's effective tier; it never carries text and is never interpolated into
+    owner prose. Suppression law (WF-GRAFT-1, after itechmeat's notifications
+    layer): when _wake_suppression finds a reason — a [SILENT] declared verdict
+    on run.done, or a node-subject notice under a tier that quiets it — NOTHING
+    is POSTed and exactly ONE typed row (`suppressed=<reason>`, delivered=False)
+    lands in the probe; a re-drive of the same instance sees that row and writes
+    nothing further, so a suppression is recorded once and never retried. The
+    operator mirror still fires (it is the operator's endpoint, not an owner
+    turn), and a notice with no suppression reason is byte-identical to before
+    this law."""
     try:
         if not run.is_dir():
             return
@@ -1182,6 +1316,22 @@ def notify(run, event, key=None, graph=None):
         _rows, delivered = _wake_ledger_read(run)
         if tid in delivered:
             return                       # delivered instance: zero rows, zero POSTs
+        reason = _wake_suppression(run, event, node, graph)
+        if reason is not None:
+            # RECORDED ONCE, NEVER RETRIED. The row is the receipt of a decision, not
+            # a failed delivery: `delivered: False` keeps it out of the delivered-set
+            # above (a delivery retry must never treat it as an undelivered attempt),
+            # and this scan makes every later re-drive of the SAME instance write
+            # nothing. A genuinely new instance (rev bump, new hold) mints a new tid
+            # and records its own one row — legible forever in the probe, which is
+            # the difference between a suppression and a hole.
+            if any(r.get("id") == tid and r.get("suppressed") for r in _rows):
+                return
+            _wake_append(run, {"ts": now(), "event": event, "run_id": run.name,
+                               "owner": owner, "id": tid, "suppressed": reason,
+                               "delivered": False, "text": text})
+            print(f"WORKFLOW_WAKE_SUPPRESSED {run.name} {event} {reason}")
+            return
         try:                             # the door's authority-law stamp, for the trail
             proto = (run / "wake_protocol").read_text().strip()
         except OSError:
@@ -7686,7 +7836,7 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                     log(run, "fanout.stragglers", node=nid, open=v["open"],
                         silent=silent, done=v["done"], items=v["items"],
                         oldest_open_age_s=v["oldest_open_age_s"], floor_s=v["floor_s"])
-                    notify(run, "fanout.stragglers", key=disc)
+                    notify(run, "fanout.stragglers", key=disc, node=nid)
             def _straggler_tick(r):
                 # A completing item records ITS completion, then re-evaluates the
                 # cohort — the event a wake names already carries this item (this
@@ -9487,7 +9637,7 @@ def main(run_id):
                                    or not isinstance(hm.get("since"), (int, float))):
                 hm = {"since": time.time(), "_def": hdef, "fp_rule_version": FP_RULE_VERSION}
                 hf.write_text(json.dumps(hm))
-            notify(run, "gate.held", key=f"{gate['id']}:{hdef}")
+            notify(run, "gate.held", key=f"{gate['id']}:{hdef}", node=gate["id"])
             if ht is None:
                 # PR#97 lost-handoff fix: the owner turn runs synchronously inside
                 # notify(). A release/stop/amend can therefore land while this runner

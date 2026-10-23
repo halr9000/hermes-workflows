@@ -10,6 +10,49 @@ A graph may set top-level `concurrency` (simultaneous agent nodes) and `item_con
 
 A graph may set top-level `result: "<node id>"` to name the node whose output IS the run verdict. It must be a string naming an existing non-gate node; a missing, non-string or gate target is refused at submit with the `result` key named. Terminal means run status ∈ {`done`, `failed`, `stopped`}: terminal `status`/`wait` reads then carry `result: {node, status, output}` for that node (`output` is null when the node did not commit one); any other status (`running`, `held`, `interrupted`, …) never grows the field. The `result` target names a node id of the EXPANDED graph — a ref to an included node must use the literal `alias__<id>` form, because validation runs post-expansion where the node id is namespaced; an exported public name is refused with the `result` key named (it fails closed, it never silently resolves). A child graph's own top-level `result` is dropped on fusion like `defaults` (no child top-level key is carried) — only the parent's composite key is meaningful. The field is carried by `run_id` reads only: the compact `lane_key` status view never carries node payloads (no outputs at all), so it omits `result` even for a declaring graph. Absent key = no `result` field and unchanged status bytes; the key never enters a node fingerprint.
 
+## Wake noise: tiers, and the `[SILENT]` verdict (optional)
+
+Two levers decide which lifecycle transitions cost the owner a turn. Both are policy over
+WAKES ONLY — scheduling, committed records, and the run verdict never read them, and a graph
+with neither key is byte-identical to before them.
+
+**`wake_tier`** — `full` | `quiet` | `silent` — is legal at graph top level (the default for
+every node) and on `agent` / `gate` nodes (the per-node override; an echo carries no
+node-subject notice, so the key is refused there). Any other value is refused at the door with
+the set named, never degraded silently to another default. A tier governs only the notices whose
+SUBJECT is that node:
+
+| tier | that fan-out's `fanout.stragglers` observation | that gate's own `gate.held` | `run.done` / `run.failed` / `run.partial` |
+|---|---|---|---|
+| `full` (absent = today) | wakes | wakes | wakes |
+| `quiet` | recorded, no wake | wakes | wakes |
+| `silent` | recorded, no wake | recorded, no wake | wakes |
+
+The last column is not tierable by law, not by convention: the run boundary is the contract that
+makes blocking `wait` optional, so no tier — not even a graph-wide `silent` — may swallow a
+run-terminal wake. `quiet` deliberately leaves a hold loud: a held gate asks the owner for an
+action, a straggler observation only reports a cohort shape. A `silent` gate is therefore an
+explicit hand-over — the author owns polling it, and `status` still answers `next:[release]`
+with the question, and the desktop card still shows it. A malformed tier (a shape the door would
+have refused, reached through a hand-edited `graph.json`) reads as `full`: the fail-open direction
+for a wake is always the loud one.
+
+**`[SILENT]`** is the Hermes convention, honored at exactly one seam — the run-result wake. On
+`run.done` the runner reads the run's DECLARED verdict: the committed output of the node the graph
+names as top-level `result:` (efp-valid — an amended-away record is not a fact). If the marker
+appears anywhere in that output (a bare string, or any field of a structured answer;
+case-sensitive, matching the host), the wake is suppressed. A suppression is a decision, not a
+delivery failure: it writes exactly ONE probe row — `{"suppressed":"silent_marker",
+"delivered":false}` in `<run>/wake.jsonl` — POSTs nothing, and is never re-recorded or retried for
+that instance, so a scheduled lap that finds nothing costs zero owner turns and stays legible in
+the probe afterwards. Binding the marker to `result` is what makes it safe: that key names the ONE
+node the author designated as the run's answer, so no other node's prose — least of all a
+prompt-injected lane output — can swallow a transition. No `result` key, a stale record, an
+unreadable graph, or a node that committed no output all wake normally. `run.failed`,
+`run.partial`, `gate.held` and `fanout.stragglers` never consult the marker, and the operator
+outbound mirror (P1) never consults either suppression — it is the operator's endpoint, not an
+owner turn.
+
 ## Terminal postmortem (optional)
 
 `on_exit: "<agent node id>"` reserves one existing non-fan-out agent for terminal cleanup, outside ordinary DAG scheduling and verdict counts. It cannot be another node's dependency or the run's `result`. After a done, failed, or stopped wave settles, its one invocation receives `on_exit (run facts)` under `## Inputs`: `run_status`, `failed_node_ids`, and `error_classes` (unknown classes remain `unknown`). Its `after`/`inputs` can read available committed outputs; missing explicit inputs and unmet publication/output preconditions fail the handler without changing the run verdict. Its `when` is not a terminal condition: the handler is unconditional.
