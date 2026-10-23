@@ -344,6 +344,24 @@ if _FAKE_MODE and _FAKE_MODE.startswith("ratelimit"):
         sys.exit(1)
     print("```json\n" + json.dumps({"result": "answered-after-window"}) + "\n```")
     sys.exit(0)
+if _FAKE_MODE == "transient_counted":   # est-9ceqc: transport death on the first
+    # FAKE_TRANSIENT_FAILS calls (keyed by query), then a clean answer. Each call
+    # bumps a durable counter file so the test reads the ACTUAL spawn count —
+    # the evidence that a persisted window deferred the respawn, never skipped it.
+    def _tt_count(key):
+        d = os.environ.get("FAKE_ATTEMPT_DIR") or "."
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "tt-" + key)
+        c = int(open(p).read()) if os.path.exists(p) else 0
+        open(p, "w").write(str(c + 1))
+        return c
+    _tt_key = "".join(ch for ch in (q.splitlines()[0] if q.strip() else "x") if ch.isalnum())[:24] or "x"
+    if _tt_count(_tt_key) < int(os.environ.get("FAKE_TRANSIENT_FAILS", "9999")):
+        print("Warning: Unknown toolsets: bogus")
+        print("hermes -z: agent failed: openai.APIConnectionError. Connection error.")
+        sys.exit(2)
+    print("```json\n" + json.dumps({"result": "answered-after-retry"}) + "\n```")
+    sys.exit(0)
 if _FAKE_MODE == "maxturns":       # prose mentions the cap — runner must NOT grep it (stays unknown)
     print("Agent reached its max turns budget and stopped.")
     sys.exit(2)
