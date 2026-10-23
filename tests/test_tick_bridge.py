@@ -177,6 +177,12 @@ def main():
         except Exception as exc:  # the honest-degradation law forbids any raise
             check("H0: cron-unavailable path never raises", False, repr(exc))
 
+        # Hermeticity receipt (est-z2heo): the REAL core cron module was never
+        # imported — every case rode the fake at the _jobs seam.
+        check("Z: the live cron store was never touched (core cron.jobs never imported)",
+              "cron.jobs" not in sys.modules,
+              sorted(m for m in sys.modules if m.startswith("cron")))
+
     print(("ALL PASS" if not FAILS else f"FAILED: {FAILS}"))
     sys.exit(1 if FAILS else 0)
 

@@ -1,5 +1,18 @@
 # Changelog
 
+- feat(cron): `cron_bridge.py` — the self-terminating watchdog tick's lifecycle
+  (est-ip975, PR-1 of 3; dormant module, no caller yet). One core cron job
+  keyed BY NAME (`hermes-workflows-tick`, `no_agent=True`, prompt None):
+  `ensure_tick()` is find-then-create (double-arm idempotent — re-arming can
+  never accumulate rows), `teardown_tick()` DELETES (never disables; jobs never
+  accumulate), `tick_schedule()` resolves WF_TICK_SCHEDULE env > config
+  `workflows.tick_schedule` > `every 2m`, and `write_shim()` mints the
+  executable bash shim under `<HERMES_HOME>/scripts/` the core scheduler
+  requires (it runs job scripts argument-free and only inside that dir). Host
+  imports ride the guarded `_jobs()` seam: no core cron degrades to a silent
+  no-op, never a raise. New test: tests/test_tick_bridge.py (hermetic — fake
+  jobs module at the seam + tmp HERMES_HOME, the live cron store is never
+  touched; red before the module, green after).
 - fix(door): a `from:<name>` string handed to the `graph` slot — the retired
   library pin — is no longer fed to `json.loads` and refused as
   "graph is not valid JSON: Expecting value...", which names the wrong
