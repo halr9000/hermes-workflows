@@ -2,12 +2,17 @@
 
 - feat(wf): answer-first closing (est-c4wx4). A suite-bearing lane that writes its
   complete answer to `<child_work_dir>/answer.json` and dies at the wall is now
-  harvested, not dead-lettered: at wall / `cap_exhausted` / rc!=0 deaths (spawn
-  AND adopted paths) with no stdout fence, the runner adopts that file under
-  `_harvest_death`'s exact gate (dict + node-schema re-validate), commits
-  `partial` with the death class unchanged and `harvest.source: "workdir"`.
+  harvested, not dead-lettered: at wall / `cap_exhausted` / rc!=0 / external-kill
+  deaths (spawn AND adopted paths) and at the #61 exit-0-with-live-tree gate —
+  SEVEN of the nine sites that consult `_harvest_death`; the two cancel-side
+  sites stay unwired because `cancelled` never adopts — with no stdout fence, the
+  runner adopts that file under `_harvest_death`'s exact gate (dict +
+  node-schema re-validate), commits `partial` with the death class unchanged and
+  `harvest.source: "workdir"`.
   Guards: mtime >= the dead attempt's spawn start (never adopt a stale file
-  across attempts), regular file only, unreadable/oversized = the death stands
+  across attempts; an unparseable spawn start fails CLOSED — the adopt path's
+  `time.time()` deadline fallback is never used as a trust anchor), regular file
+  only, unreadable/oversized = the death stands
   unchanged, `cancelled` never adopts. The writer sentence rides the reply
   CONTRACT and WORK_DIR_NOTE (the per-item absolute path stays in the goal
   half — the fan-out byte-identity law forbids per-item interpolation after

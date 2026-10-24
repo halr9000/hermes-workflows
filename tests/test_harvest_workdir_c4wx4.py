@@ -40,7 +40,7 @@ answer-first sentence.
 
 Run: python3 tests/test_harvest_workdir_c4wx4.py
 """
-import json, os, subprocess, sys, tempfile, time
+import json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -239,6 +239,35 @@ if pp.exists():
           f"{wd}/answer.json" in pp.read_text(), pp.read_text()[-300:])
 else:
     check("W3 the live prompt carries the ABSOLUTE <work_dir>/answer.json path", False, "prompt missing")
+
+# W4 — the SITE LAW (deep review on #541, adversary finding #4): the PR may not
+# claim parity it didn't implement. _harvest_death is consulted at NINE sites;
+# the workdir sibling rides SEVEN; the two cancel-side sites stay unwired by I2
+# law. Pinned by census over the real source, not by prose.
+_src = (HERE.parent / "wf.py").read_text()
+_dead_sites = len(re.findall(r"_harvest_death\(", _src)) - 1          # minus the def
+_wd_sites = len(re.findall(r"_harvest_workdir\(", _src)) - 1          # minus the def
+check("W4 nine _harvest_death consult sites (census, not prose)", _dead_sites == 9, str(_dead_sites))
+check("W4 seven _harvest_workdir sites wired", _wd_sites == 7, str(_wd_sites))
+_tree_gate = re.search(r"tree_seen, bool\(hv\)\)", _src)
+check("W4 the #61 gate routes on hv AFTER the workdir fallback", _tree_gate is not None)
+for _fn in ("_cancel_evidence", "_harvest_cancelled"):
+    _m = re.search(rf"def {_fn}\(.*?(?=\ndef )", _src, re.S)
+    check(f"W4 {_fn} stays unwired (cancelled NEVER adopts)",
+          _m is not None and "_harvest_workdir(" not in _m.group(0))
+
+# W5 — the ANCHOR LAW (adversary finding #5): the adopt path's deadline math has
+# always degraded to `now` on an unparseable child start; the est-c4wx4 mtime
+# guard must NOT inherit that fallback (a now-anchor would let a previous
+# attempt's file pass). It fails closed by passing None instead.
+_a = re.search(r"def _adopt_child\(.*?(?=\ndef )", _src, re.S)
+check("W5 _adopt_child found (census harness alive)", _a is not None)
+_adopt = _a.group(0) if _a else ""
+check("W5 unparseable spawn start -> harvest_anchor=None (fail closed)",
+      re.search(r"except \(TypeError, ValueError\):\n(?:.*\n)*?\s+started_epoch = time\.time\(\)\n\s+harvest_anchor = None", _adopt) is not None)
+check("W5 both adopted-path harvests pass harvest_anchor (never the time.time() fallback)",
+      _adopt.count("harvest_schema, harvest_anchor)") == 2,
+      str(_adopt.count("harvest_schema, harvest_anchor)")))
 
 print("HARVEST-WORKDIR est-c4wx4:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
