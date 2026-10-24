@@ -82,7 +82,8 @@ def transient_delay(seed_val, raw):
             first = {"status": "failed", "error_class": "transport", "skey": "s0",
                      "attempts": 1, "spawn": 0, "raw": raw}
             random.seed(seed_val)
-            engine._transient_retry(meta, first, spawn, "node", {"node": "a"})
+            engine._transient_retry(meta, first, spawn, "node", {"node": "a"},
+                                    defer=False)   # est-9ceqc: in-place seam (no driver here); the schedule below is what this test pins
         finally:
             engine._attempt_api_calls = orig_calls
         events = [json.loads(l) for l in (run / "events.jsonl").read_text().splitlines()]
@@ -107,9 +108,9 @@ check("failed record carries the subtype marker, class stays transport",
 # non-429 transport keeps the fixed ladder exactly
 conn_raw = "hermes -z: agent failed: openai.APIConnectionError. Connection error."
 _, ev3 = transient_delay(11, conn_raw)
-check("non-429 transport keeps the fixed ladder (5.0 s first step)",
-      len(ev3) == 1 and ev3[0]["backoff_s"] == 5.0 and ev3[0]["rate_limited"] is False,
-      json.dumps(ev3))
+check("non-429 transport keeps the deterministic ladder (2.0 s first step)",
+      len(ev3) == 1 and ev3[0]["backoff_s"] == 2.0 and ev3[0]["rate_limited"] is False,
+      json.dumps(ev3))  # est-9ceqc: the pinned LAW is determinism-vs-jitter; the fixed [5,20] first step was superseded by the exp base (2.0 s default)
 
 # ---- bounded retry: rate-limited wait is a jitter draw within [0, 5]; others fixed ----
 class FakeStop:

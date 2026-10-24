@@ -200,3 +200,36 @@ Every expanded run records provenance: `run.json.includes = [{alias, name, sourc
 Use `graph_path` with run/save/amend/validate for a caller-authorized absolute local regular UTF-8 JSON file, at most 1 MiB, no final symlink. Choose exactly one source: inline graph, graph_path, or run's `from` / save's `run_id`. Validation completes before writing or spawning. Save to the library and replay with `from` for repeated use; graph_path is valuable for an unsaved local graph or replacement amendment. Neither feature asserts a universal tool-argument length limit.
 
 A shared file may state its dialect with a top-level `grammar` key (`"wf/1"`; absent = `wf/1` for every pre-#32 file). A value this reader does not support is refused before any write or spawn, with the supported list in the error. Like `provenance`, `grammar` is a top-level annotation — never part of a node, so `def_hash`, `efp`, `graph_fingerprint` and `source_digest` are unchanged by it. The publishing convention (`<name>.workflow.json`, provenance, pinned digests, the no-code note) is [portable](portable.md).
+
+## Persisted transient retry (est-9ceqc)
+
+The transient ladder's schedule is exponential `min(base * 2**(attempt-1), ceiling)`
+— default 3 TOTAL attempts, base 2.0 s, ceiling 30.0 s — superseding the fixed
+`[5, 20]` ladder (rate-limited full-jitter and the bounded ladder still read
+`retry_backoff`; `_ratelimit_park` and `_bounded_retry` are untouched — this
+lands on top of them). Tunables are door-meta ONLY: the `retry_policy` run arg
+`{max_attempts 1..9, base_seconds, ceiling_seconds}` (same channel law as
+`retry_backoff`/`retry_budget`, no env hooks); an author `retry.transient` cap
+still outranks the door max. Every transient retry decision persists
+`{attempts, retry_after, log}` to `<run>/retry_state.json` — runner-owned
+sidecar state, tmp+os.replace, keyed per node AND fan-out item index (`node#i`);
+NEVER `run.json` (the door owns it), never `graph.json`, never a committed node
+record; a corrupt or absent file is NO pending window, never a runner death.
+The ladder DEFERS instead of sleeping in place: it persists the window, returns
+`{status: "deferred", deferred_until}`, and the worker returns its slot. The
+wave/fan-out driver re-drives the unit only after the persisted deadline passes
+(`_retry_drain`; stop and fan-out quorum cancel stay observed; the idle sits on
+the driver, never on a held slot or seat); a solo node with an open window is
+held out of the wave entirely. A runner SIGKILLed mid-window and resumed via
+the door spawns NOTHING for the unit before the deadline; attempt counts
+continue from the persisted number and the bound applies across the restart.
+The `node.retrying` machine-wait event keeps `backoff_s` and adds the persisted
+`retry_after`; terminal exits purge the unit's window; the committed `attempts`
+is the whole lifetime (max of the persisted seed plus this pass's own log
+entries, and the runner's `spawn_no + 1`), and the deferred pass carries its
+attempts_log forward so the committed cross-ladder history (park-first, est-ja41)
+survives deferral. The Q4 shared `retry_budget` law is intact: every persisted
+attempt draws it; an exhausted budget opens no window and keeps the pre-existing
+`transport_exhausted` demote. Direct in-place consumers (the consolidate batch
+cell; tests that pin the park/history handoff) call the documented
+`defer=False` seam.
