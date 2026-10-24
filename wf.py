@@ -7243,7 +7243,10 @@ def _retry_state_read(meta):
     file, never a torn one."""
     try:
         raw = json.loads((meta["_run"] / RETRY_STATE_FILE).read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError, AttributeError):
+        # est-9ceqc: EVERY internal failure — absent file, torn JSON, and an
+        # unusable run handle (meta["_run"] is None on synthetic/direct-call
+        # shapes) — is NO pending window, never a runner death (fail-open law).
         return {}
     return raw if isinstance(raw, dict) else {}
 
@@ -7256,8 +7259,10 @@ def _retry_state_write(meta, entries):
         tmp = meta["_run"] / (RETRY_STATE_FILE + ".tmp")
         tmp.write_text(json.dumps(entries))
         os.replace(tmp, meta["_run"] / RETRY_STATE_FILE)
-    except OSError:
+    except (OSError, TypeError, AttributeError):
         pass      # the state file is the window channel; loss fails open
+                  # (est-9ceqc: an unusable run handle is a silent no-op,
+                  # never a runner death — the fail-open law of the read)
 
 
 def _retry_state_lock(meta):
