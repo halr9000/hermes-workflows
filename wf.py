@@ -7269,7 +7269,8 @@ def _retry_state_lock(meta):
     return meta.setdefault("_retry_state_lock", threading.Lock())
 
 
-def _retry_state_put(meta, key, attempts, retry_after, error_class=None, log=None):
+def _retry_state_put(meta, key, attempts, retry_after, error_class=None, log=None,
+                     hint=None):
     with _retry_state_lock(meta):
         ents = _retry_state_read(meta)
         ent = {"attempts": int(attempts), "retry_after": float(retry_after)}
@@ -7279,6 +7280,10 @@ def _retry_state_put(meta, key, attempts, retry_after, error_class=None, log=Non
             # ladder/park history forward so the terminal commit stays honest.
             ent["log"] = [{"attempt": e.get("attempt"), "error_class": e.get("error_class"),
                            "at": e.get("at")} for e in list(log)[-8:]]
+        if hint:  # est-9ceqc: the #130 resume preamble the deferred respawn WOULD
+            # have carried; the driver re-drive re-adopts it so the machine
+            # preamble law survives deferral and restart alike.
+            ent["hint"] = str(hint)
         ents[str(key)] = ent
         _retry_state_write(meta, ents)
 
@@ -7306,6 +7311,17 @@ def _retry_window_open(meta, key):
         return isinstance(ent, dict) and float(ent.get("retry_after", 0)) > time.time()
     except (TypeError, ValueError):
         return False
+
+
+def _retry_pending_hint(meta, key):
+    """est-9ceqc: the #130 resume preamble carried across a deferred window —
+    a (re-)driven spawn past the deadline wears it, exactly as the in-place
+    respawn would have. Empty string when no entry/hint (fail-open)."""
+    try:
+        ent = _retry_state_read(meta).get(str(key)) or {}
+        return str(ent.get("hint") or "") if isinstance(ent, dict) else ""
+    except Exception:
+        return ""
 
 
 def _retry_drain(meta, units_fn, redrive, cancel=None):
@@ -7460,9 +7476,14 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
             iso["attempts_log"] = attempts_log
             _retry_state_pop(meta, key)
             return iso
+        # est-9ceqc: the #130 resume preamble is computed BEFORE the window
+        # opens — the deferred re-drive re-adopts it from the sidecar so the
+        # machine preamble law survives deferral and restart alike.
+        hint = _resume_hint_block(run, node, ev_kw.get("index"), attempts_log)   # #130
         if defer:
             _retry_state_put(meta, key, ladder_attempts, deadline,
-                             error_class=r["error_class"], log=attempts_log)
+                             error_class=r["error_class"], log=attempts_log,
+                             hint=hint)
             return {"status": "deferred", "error_class": r["error_class"],
                     "error": r.get("error"), "deferred_until": deadline,
                     "ms": 0, "skey": r.get("skey")}
@@ -7471,7 +7492,6 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
             break
         if meta["_stop"].is_set():
             break
-        hint = _resume_hint_block(run, node, ev_kw.get("index"), attempts_log)   # #130
         r = respawn(resume_preamble=hint) if hint else respawn()
         # wf159c finding 2: a banner death that surfaces AFTER a ladder
         # respawn must reach the park too — the dispatcher contract (parks
@@ -8439,6 +8459,10 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                                      seat_cancel=fo_cancel, seat_hold=held,
                                      seat_admit_lock=lock, model_override=model_override)
                 def spawn(resume_preamble="", model_override=None):
+                    # est-9ceqc: a re-driven item whose persisted window just
+                    # lapsed re-adopts the deferred preamble (#130 law intact).
+                    if not resume_preamble:
+                        resume_preamble = _retry_pending_hint(meta, "%s#%d" % (nid, i))
                     # est-g255 P255-1: only a DONE answer can trip quorum, so only
                     # its seat stays deferred until one()'s quorum block below; any
                     # other verdict frees the seat now (a retry backoff or a
@@ -8683,6 +8707,11 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
                                 "error_class": "cancelled", "ms": 0}
                     return {"status": "deferred", "error_class": "deferred_window",
                             "error": "persisted transient-retry window open", "ms": 0}
+                # est-9ceqc: a (re-)driven entry whose persisted window just
+                # lapsed re-adopts the preamble the deferred respawn would have
+                # carried (#130 law survives deferral and restart alike).
+                if not resume_preamble:
+                    resume_preamble = _retry_pending_hint(meta, str(nid))
                 sk = solo_key if not first["done"] else skey_for(run, byid, node)
                 first["done"] = True
                 detached = _poll_registered_job(meta, node, byid)
