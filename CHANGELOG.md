@@ -1,5 +1,20 @@
 # Changelog
 
+- feat(wf): answer-first closing (est-c4wx4). A suite-bearing lane that writes its
+  complete answer to `<child_work_dir>/answer.json` and dies at the wall is now
+  harvested, not dead-lettered: at wall / `cap_exhausted` / rc!=0 deaths (spawn
+  AND adopted paths) with no stdout fence, the runner adopts that file under
+  `_harvest_death`'s exact gate (dict + node-schema re-validate), commits
+  `partial` with the death class unchanged and `harvest.source: "workdir"`.
+  Guards: mtime >= the dead attempt's spawn start (never adopt a stale file
+  across attempts), regular file only, unreadable/oversized = the death stands
+  unchanged, `cancelled` never adopts. The writer sentence rides the reply
+  CONTRACT and WORK_DIR_NOTE (the per-item absolute path stays in the goal
+  half — the fan-out byte-identity law forbids per-item interpolation after
+  `## Inputs`). Banking (#131), the est-ggqs bounded re-drive,
+  `harvest_policy: validate` and `after_partial` compose unchanged; the
+  stdout-harvest error texts are byte-identical.
+  Tests: tests/test_harvest_workdir_c4wx4.py (red before, green after).
 - feat(cron): `cron_bridge.py` — the self-terminating watchdog tick's lifecycle
   (est-ip975, PR-1 of 3; dormant module, no caller yet). One core cron job
   keyed BY NAME (`hermes-workflows-tick`, `no_agent=True`, prompt None):
