@@ -163,7 +163,11 @@ with tempfile.TemporaryDirectory(prefix="lifecycle-next-", dir=HERE) as td:
     run_stub = Path(td) / "retry-wrapper"
     run_stub.mkdir()
     meta = {"_run": run_stub, "_stop": threading.Event(), "_procs_lock": threading.Lock(),
-            "_retries_left": 6, "retry_backoff": [0, 0]}
+            "_retries_left": 6, "retry_backoff": [0, 0],
+            # est-9ceqc: this wrapper check counts IN-PLACE respawns — pin the
+            # defer=False cell shape; base_seconds=0 (door channel) keeps the
+            # loop sleeping-free. The deferred shape is pinned elsewhere.
+            "retry_policy": {"base_seconds": 0}}
     original = engine._attempt_api_calls
     engine._attempt_api_calls = lambda _run, _key: 0
     calls = []
@@ -173,7 +177,8 @@ with tempfile.TemporaryDirectory(prefix="lifecycle-next-", dir=HERE) as td:
                 "spawn": len(calls), "output": {"ok": True}}
     try:
         first = {"status": "failed", "error_class": "unknown", "skey": "first", "attempts": 1, "spawn": 0}
-        retried = engine._transient_retry(meta, first, retry_spawn, "item", {"node": "f", "index": 0})
+        retried = engine._transient_retry(meta, first, retry_spawn, "item", {"node": "f", "index": 0},
+                                          defer=False)
     finally:
         engine._attempt_api_calls = original
     check("retry result exposes total attempts across transient respawns",
