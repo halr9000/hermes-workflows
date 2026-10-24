@@ -292,6 +292,38 @@ publication guards, and crash recovery.
   next attempt key (never `--continue` the busy session) and WITHOUT the tool-progress
   precondition — the CLI's own lease notice proves the attempt never ran; its machine-wait
   event is `node.retrying error_class=lease_busy`.
+- The transient ladder's window PERSISTS (est-9ceqc): a transient-classified death with
+  attempts left no longer sleeps a worker slot in place — the runner persists
+  `retry_state.json` (FLAT `{key: {attempts, retry_after, last_error_class}}`, atomic
+  tmp+replace, keyed per node and per fan-out item `node#index`) and DEFERS: the worker
+  returns its slot, the wave loop holds the unit out of dispatch until the deadline, and
+  the per-run drain re-drives it at deadline observing stop + quorum cancel. A restart
+  mid-window reads the same file: the deadline is honored (no instant respawn), the
+  attempt count CONTINUES, and the bound still applies. Defaults follow the peer
+  RetryPolicy invariant — 3 attempts, delay=min(2·2^(n-1), 30) s — overridable ONLY by
+  the door-meta `retry_policy` channel (`{max_attempts, base_seconds, ceiling_seconds}`);
+  an author `retry.transient` cap still wins on the count. Missing/corrupt state file
+  fails open to today's behavior. The Q4 `retry_budget` draw law, `_bounded_retry` and
+  `_ratelimit_park` semantics are untouched — this lands on top. The fixed `[5, 20]`
+  transient schedule is SUPERSEDED (knob law survives re-pinned); `node.retrying` events
+  carry `retry_after` alongside `backoff_s` so dispatchers read windows from events.
+- The transient ladder's window PERSISTS (est-9ceqc, WF-GRAFT-5): every transient
+  retry decision writes `{attempts, retry_after}` to `<run>/retry_state.json`
+  (runner-owned state — never `run.json`, never `graph.json`, never a committed node
+  record; flat `{key -> entry}` keyed per node and fan-out item index; corrupt or
+  absent file means NO pending window, never a runner death) and DEFERS the re-drive
+  instead of sleeping in place: the worker returns its slot, the wave/fan-out driver
+  re-drives the unit only once wall-clock passes the persisted deadline (stop and
+  fan-out quorum cancel stay observed; the idle sits on the driver, never on a held
+  slot), and a runner restarted mid-window spawns NOTHING for the unit before the
+  deadline — attempt counts continue and the bound still applies. The schedule is
+  exponential `min(base * 2**(attempt-1), ceiling)` — 3 total attempts, base 2.0 s,
+  ceiling 30.0 s by default — door-meta override ONLY (`retry_policy` run arg
+  `{max_attempts, base_seconds, ceiling_seconds}`; an author `retry.transient` cap
+  still outranks). The `node.retrying` event keeps `backoff_s` and adds `retry_after`.
+  Q4 `retry_budget` draws unchanged; `_bounded_retry` and the `ratelimit` park are
+  untouched — this lands on top of them. The fixed `[5, 20]` transient schedule is
+  superseded (rate-limited jitter and the bounded ladder still read `retry_backoff`).
 - A child silent for 120 s after spawn is killed as `early_death`; a child still writing its
   log when the wall fires gets one 50 % extension (`node.extended`), then dies.
 - A wall-killed child's corpse is banked (#131): `nodes/<id>[.<i>].corpus/` holds `work/`

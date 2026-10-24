@@ -38,6 +38,27 @@
   first at every quiescent boundary — before the on_fail-catch opportunity
   and before finalize-done — and a flagged run spawns nothing new (in-flight
   waves drain, never killed). Tests: tests/test_fail_closed_f1w4u.py.
+- feat(retry): the transient ladder's window survives a restart (est-9ceqc,
+  WF-GRAFT-5). Every transient retry decision persists `{attempts, retry_after}`
+  per (node, fan-out item index) to `<run>/retry_state.json` — flat
+  `{key -> entry}`, tmp+os.replace, runner-written (never `run.json`, never
+  `graph.json`, never a committed node record) — and DEFERS the re-drive instead
+  of sleeping in place: the worker releases its slot, the wave/fan-out driver
+  drain re-drives the unit at the persisted deadline (stop and quorum cancel
+  observed), and a runner SIGKILLed mid-window and resumed spawns NOTHING before
+  the deadline — attempt counts continue and the bound still lands
+  `transport_exhausted`. The schedule becomes exponential
+  `min(base*2**(attempt-1), ceiling)` at 3 total attempts / base 2.0 s / ceiling
+  30.0 s, door-meta override ONLY (run arg
+  `retry_policy {max_attempts, base_seconds, ceiling_seconds}`; an author
+  `retry.transient` cap still outranks). `node.retrying` keeps `backoff_s` and
+  gains `retry_after`; the Q4 `retry_budget` draw law is untouched, and a
+  corrupt or absent state file means no pending window (fail-open, never a
+  runner death). The fixed `[5, 20]` transient ladder is superseded — the
+  rate-limited jitter draw and the bounded ladder still read `retry_backoff`.
+  Tests: tests/test_persisted_transient_retry.py (unit + SIGKILL/resume
+  integration); tests/test_retry_knobs_23c.py pins re-pinned to the in-place
+  (`defer=False`) shape with the door-channel zero-sleep, intent unchanged.
 
 - fix(watchdog): the fanout.stragglers disc formats a missing launch stamp as
   the `'q'` literal, never through `:.3f` (est-waf8y, est-c0jo1 passport D1).
