@@ -211,8 +211,16 @@ def _gated(k):
     nxt = evs[k + 1].get("event") if k + 1 < len(evs) else None
     if nxt == "steer.baked":
         return True
-    return (nxt == "node.respawn_reap"
+    if (nxt == "node.respawn_reap"
             and k + 2 < len(evs) and evs[k + 2].get("event") == "steer.baked"
+            and evs[k + 1].get("proof") == "dead" and evs[k + 1].get("prior_alive") == []):
+        return True
+    # est-9ceqc: under the persisted-window law a re-drive is a FRESH node entry,
+    # so the gated spawn carries its own node.started before steer.baked. Same
+    # law — prior tree proven dead before the next Popen — admitted shape widened.
+    return (nxt == "node.respawn_reap"
+            and k + 3 < len(evs) and evs[k + 2].get("event") == "node.started"
+            and evs[k + 3].get("event") == "steer.baked"
             and evs[k + 1].get("proof") == "dead" and evs[k + 1].get("prior_alive") == [])
 check("R-B tree_kill proves the prior tree dead before the next spawn",
       len(kills) == len(spawns) - 1 == 2
