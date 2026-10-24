@@ -7975,7 +7975,14 @@ def run_agent_node(run, meta, byid, node, outputs, steering):
             error_class="inputs", attempts=0)
         return
     solo_key = None if node.get("fanout") else skey_for(run, byid, node)
-    log(run, "node.started", node=nid, skey=solo_key)
+    # est-9ceqc x #61: a DEFERRED re-drive (a persisted sidecar entry exists for
+    # this solo unit) must not re-log node.started. The in-place ladder never
+    # re-logged it, and the #61c adjacency law reads the admitted run after a
+    # quarantine as [respawn_reap ->] steer.baked — a node.started wedged between
+    # the reap and the spawn marker breaks the gate R-B pins. One node.started
+    # per unit lifetime, exactly as the in-place shape always emitted it.
+    if node.get("fanout") or not _retry_state_read(meta).get(str(nid)):
+        log(run, "node.started", node=nid, skey=solo_key)
     try:
         if node.get("fanout"):
             fo = node["fanout"]
