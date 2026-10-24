@@ -387,13 +387,7 @@ same gates ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
 
 ### 4b′. Navigate with the knowledge graph (optional)
 
-[`graphify`](https://github.com/Graphify-Labs/graphify) builds a code-navigation
-graph locally (`uv tool install graphifyy` → `graphify update .`; query/path/
-affected/god-nodes; `.graphifyignore` ships). Exploration aid, not a gate: never
-committed, CI never builds it, a `graphify-out/` in your PR diff is deleted by
-review. Source and tests are the spec. (`scripts/graph_diagram.py` +
-`diagram_readme.py` are unrelated — they draw the `examples/README.md` diagrams.)
-
+`graphify` is a LOCAL exploration aid only, never a gate (diff containing `graphify-out/` is deleted in review); details: references/operations.md.
 ### 4c. Rules
 
 1. **Lane-scoped edits.** Touch only the files your task names. Never amend or rebase

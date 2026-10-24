@@ -193,3 +193,11 @@ At the wave boundary the runner writes `budget_ledger.json` (`exhausted_nodes`,
 (`cap_tokens`, `spent_tokens`, `per_node`, ledger fields) — terminal, `next: []`.
 Raising a cap is an amend: `budget` is policy, excluded from the node efp (same law as
 `run_budget`), so committed nodes stay frozen and replay-skip holds.
+## graphify (local exploration aid)
+
+[`graphify`](https://github.com/Graphify-Labs/graphify) builds a code-navigation
+graph locally (`uv tool install graphifyy` → `graphify update .`; query/path/
+affected/god-nodes; `.graphifyignore` ships). Exploration aid, not a gate: never
+committed, CI never builds it, a `graphify-out/` in your PR diff is deleted by
+review. Source and tests are the spec. (`scripts/graph_diagram.py` +
+`diagram_readme.py` are unrelated — they draw the `examples/README.md` diagrams.)
