@@ -7391,10 +7391,16 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
     # est-9ceqc: a re-driven (possibly restarted) entry CONTINUES the persisted
     # count — the attempt bound never restarts with the process.
     key = _retry_state_key(ev_kw)
+    seed_ent, seed = {}, 0
     try:
-        seed = int(_retry_state_read(meta).get(key, {}).get("attempts", 0))
+        seed_ent = _retry_state_read(meta).get(key, {}) or {}
+        seed = int(seed_ent.get("attempts", 0))
     except (TypeError, ValueError, AttributeError):
-        seed = 0
+        seed_ent, seed = {}, 0
+    # est-9ceqc: the deferred pass carries its attempts_log forward in the
+    # sidecar; the terminal commit re-adopts it so the cross-ladder history
+    # (park-first) survives a deferral exactly as it survived an in-place wait.
+    seed_log = [e for e in (seed_ent.get("log") or []) if isinstance(e, dict)]
     ladder_attempts = seed if seed > 0 else 0
     while (r.get("status") == "failed" and r.get("error_class") in _RETRYABLE_CLASSES
            and ladder_attempts < cap):
@@ -7451,7 +7457,7 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
             return iso
         if defer:
             _retry_state_put(meta, key, ladder_attempts, deadline,
-                             error_class=r["error_class"])
+                             error_class=r["error_class"], log=attempts_log)
             return {"status": "deferred", "error_class": r["error_class"],
                     "error": r.get("error"), "deferred_until": deadline,
                     "ms": 0, "skey": r.get("skey")}
@@ -7490,6 +7496,13 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
             reason="persisted transient attempts exhausted (resumed run)",
             error_class=r.get("error_class"), **ev_kw)
     if attempts_log or seed:
+        own_att = len(attempts_log) - inherit_n   # est-9ceqc: before the carry-merge
+        if seed and seed_log:
+            seen = {(e.get("at"), e.get("error_class")) for e in attempts_log}
+            carried = [e for e in seed_log
+                       if (e.get("at"), e.get("error_class")) not in seen]
+            if carried:
+                attempts_log = carried + attempts_log
         if attempts_log:
             r["attempts_log"] = attempts_log
         last_spawn = r.get("spawn")
@@ -7500,8 +7513,7 @@ def _transient_retry(meta, r, respawn, ev, ev_kw, node=None, cancel=None, defer=
         # keys persist across restarts), so the seed adds nothing when it is
         # ahead; a synthetic/park-shaped record without a lifetime spawn index
         # falls back to the persisted seed plus this entry's own appends.
-        r["attempts"] = max(seed + (len(attempts_log) - inherit_n),
-                            base_att) if seed else base_att
+        r["attempts"] = max(seed + own_att, base_att) if seed else base_att
         # est-ja41: transport_exhausted is the LADDER's own verdict — "this
         # ladder spent its respawns on the SAME dead model". An inherited park
         # history proves nothing about this ladder; for no-inherit runs
