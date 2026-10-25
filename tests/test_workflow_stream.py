@@ -6,6 +6,7 @@ scratch run dirs via wfcommon.run_state (no network anywhere)."""
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -447,6 +448,184 @@ def test_act_stream_check_preflight_offline():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def test_discover_chat_parses_updates_and_suggests_env_line():
+    results = {"getMe": {"username": "stream_bot", "id": 7},
+               "getUpdates": [
+                   {"update_id": 1, "message": {"chat": {"id": 595846104, "type": "private",
+                                                         "username": "hal", "first_name": "Hal"}}},
+                   {"update_id": 2, "my_chat_member": {"chat": {"id": -100200, "type": "supergroup",
+                                                                "title": "Ops"}}},
+               ]}
+    stub_cls = lambda *a, **k: StubTransport(results=results)
+    with patch.object(ws, "TelegramTransport", stub_cls):
+        lines, problems = ws.discover_chats("tok")
+    assert not problems
+    assert any("@stream_bot" in line for line in lines)
+    assert any("595846104" in line and "private" in line for line in lines)
+    assert any("-100200" in line and "Ops" in line for line in lines)
+    assert any("WORKFLOW_STREAM_CHAT_ID=-100200" in line for line in lines)  # most recent wins
+    assert any("@userinfobot" in line for line in lines)
+
+
+def test_discover_chat_without_updates_asks_for_a_start_message():
+    stub_cls = lambda *a, **k: StubTransport(results={"getMe": {"username": "b", "id": 7},
+                                                     "getUpdates": []})
+    with patch.object(ws, "TelegramTransport", stub_cls):
+        lines, problems = ws.discover_chats("tok")
+    assert lines and problems
+    assert any("/start" in p and "--discover-chat" in p for p in problems)
+
+
+def test_discover_chat_reports_dead_token():
+    stub_cls = lambda *a, **k: StubTransport(error=ws.TelegramError(404, "Not Found"))
+    with patch.object(ws, "TelegramTransport", stub_cls):
+        lines, problems = ws.discover_chats("dead")
+    assert not lines and any("BOT_TOKEN rejected" in p for p in problems)
+
+
+def test_set_env_file_value_replaces_in_place_and_scopes_keys():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        (home / ".env").write_text(
+            "ANTHROPIC_API_KEY=keep\n"
+            "WORKFLOW_STREAM_WATCH=telegram\n"
+            "# trailing comment\n")
+        with patch.object(common, "hermes_home", lambda: home):
+            path = ws.set_env_file_value("WORKFLOW_STREAM_WATCH", "off")
+            assert path == home / ".env"
+            text = path.read_text()
+            assert "WORKFLOW_STREAM_WATCH=off" in text
+            assert "ANTHROPIC_API_KEY=keep" in text and "# trailing comment" in text
+            assert "WORKFLOW_STREAM_WATCH=telegram" not in text
+            ws.set_env_file_value("WORKFLOW_STREAM_CHAT_ID", "123")  # absent key appends
+            assert "WORKFLOW_STREAM_CHAT_ID=123" in path.read_text()
+            try:
+                ws.set_env_file_value("ANTHROPIC_API_KEY", "x")
+                raised = None
+            except ValueError as exc:
+                raised = str(exc)
+            assert raised and "WORKFLOW_STREAM_" in raised
+
+
+def test_read_env_file_watch_live_toggle_ignores_environ_cache():
+    saved = os.environ.pop("WORKFLOW_STREAM_WATCH", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            env_path = home / ".env"
+            with patch.object(common, "hermes_home", lambda: home):
+                assert ws.read_env_file_watch("all") == "all"        # file absent -> default
+                env_path.write_text("WORKFLOW_STREAM_WATCH=telegram\n")
+                assert ws.read_env_file_watch("all") == "telegram"   # file is the source
+                env_path.write_text("WORKFLOW_STREAM_WATCH=off\n")   # /workflow-stream off
+                assert ws.read_env_file_watch("all") == "off"        # picked up live
+                env_path.write_text("WORKFLOW_STREAM_BOT_TOKEN=x\n")  # unset -> default
+                assert ws.read_env_file_watch("all") == "all"
+    finally:
+        if saved is not None:
+            os.environ["WORKFLOW_STREAM_WATCH"] = saved
+
+
+class FailTextTransport(FakeTransport):
+    """FakeTransport that can be scripted to fail sends (dead-token scenario)."""
+
+    def __init__(self, send_text_errors=()):
+        super().__init__()
+        self.send_text_errors = list(send_text_errors)
+
+    def send_text(self, text, reply_to=None):
+        if self.send_text_errors:
+            self.calls.append(("send_text_error", text))
+            raise self.send_text_errors.pop(0)
+        return super().send_text(text, reply_to=reply_to)
+
+
+def test_failure_beacon_written_then_cleared_on_recovery():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        make_run(tmp, "beacon", AGENT_GATE,
+                 node_states={"a": {"status": "running", "pid": 0}})
+        beacon = Path(tmp) / ws.STREAM_STATUS_FILE
+        transport = FailTextTransport(
+            [ws.TelegramError(404, "Not Found")])  # dead token at adoption
+        watcher = watcher_with(tmp, transport)
+        stats = watcher.poll()
+        assert stats["errors"] == 1
+        record = json.loads(beacon.read_text())
+        assert record["failures"] == 1 and "Not Found" in record["error"]
+        assert record["since"] and record["last_at"]
+        # recovery: a healthy poll clears the beacon
+        watcher.transport = FailTextTransport()
+        stats = watcher.poll()
+        assert stats["adopted"] == 1 and stats["errors"] == 0
+        assert not beacon.exists()
+
+
+def test_workflow_stream_command_toggles_and_reports():
+    # House convention: load the plugin door by path, never `import __init__`.
+    door_spec = importlib.util.spec_from_file_location("stream_cmd_door", ROOT / "__init__.py")
+    plugin = importlib.util.module_from_spec(door_spec)
+    door_spec.loader.exec_module(plugin)
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        saved = {k: os.environ.get(k) for k in
+                 ("WORKFLOW_STREAM_BOT_TOKEN", "WORKFLOW_STREAM_CHAT_ID")}
+        try:
+            for key in saved:  # this shell exports real values; keep the test offline
+                os.environ.pop(key, None)
+            with patch.object(common, "hermes_home", lambda: home):
+                sys.modules["workflow_stream"] = ws
+                off = plugin._workflow_stream_command("off")
+                assert "WATCH=off" in off and "no restart" in off
+                assert "WORKFLOW_STREAM_WATCH=off" in (home / ".env").read_text()
+                on = plugin._workflow_stream_command("on")
+                assert "WATCH=all" in on
+                assert "WORKFLOW_STREAM_WATCH=all" in (home / ".env").read_text()
+                unknown = plugin._workflow_stream_command("wat")
+                assert "Usage:" in unknown
+                status = plugin._workflow_stream_command("")
+                assert "watch=all" in status and "last stream error: none" in status
+                # setup without a token walks the user to BotFather, never network
+                setup = plugin._workflow_stream_command("setup")
+                assert "BotFather" in setup
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def test_status_report_surfaces_beacon():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        runs = Path(tmp) / "runs"
+        runs.mkdir()
+        (runs / ws.STREAM_STATUS_FILE).write_text(json.dumps(
+            {"error": "HTTP 404 Not Found", "failures": 7,
+             "since": "2026-10-25T12:00:00+00:00", "last_at": "2026-10-25T12:01:00+00:00"}))
+        saved = {k: os.environ.get(k) for k in
+                 ("WORKFLOW_STREAM_BOT_TOKEN", "WORKFLOW_STREAM_CHAT_ID", "WF_RUNS_ROOT")}
+        try:
+            os.environ.pop("WORKFLOW_STREAM_BOT_TOKEN", None)
+            os.environ.pop("WORKFLOW_STREAM_CHAT_ID", None)
+            os.environ["WF_RUNS_ROOT"] = str(runs)
+            isolated = Path(tempfile.mkdtemp())  # no .env: keep real creds out of the report
+            try:
+                with patch.object(common, "hermes_home", lambda: isolated):
+                    report = ws.stream_status_report()
+            finally:
+                shutil.rmtree(isolated, ignore_errors=True)
+            assert report["token_set"] is False and report["chat_set"] is False
+            assert report["graphic_deps_ok"] is True
+            assert report["beacon"]["failures"] == 7
+            assert report["daemon_pids"] == [] or report["daemon_pids"]  # env-dependent, shape only
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":
