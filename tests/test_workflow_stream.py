@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""workflow-stream daemon tests against a recording fake Transport — lifecycle,
+edge-triggered edits, pin/unpin, WATCH filtering, throttle backoff, restart
+recovery, deleted-message repost — plus read-model text rendering over
+scratch run dirs via wfcommon.run_state (no network anywhere)."""
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import wfcommon as common
+
+_spec = importlib.util.spec_from_file_location(
+    "workflow_stream", ROOT / "scripts" / "workflow_stream.py")
+ws = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ws)
+
+STARTED = "2026-10-25T12:00:00+00:00"
+
+
+def write(path, obj):
+    path.write_text(json.dumps(obj))
+
+
+def stamp(byid, node):
+    return {"efp": common.efp(byid, node), "fp_rule_version": common.FP_RULE_VERSION}
+
+
+class FakeTransport(ws.Transport):
+    """In-memory recording fake. message ids increment; failures scripted."""
+
+    def __init__(self):
+        self.calls = []
+        self._next = 100
+        self.edit_errors = []
+
+    def _id(self):
+        self._next += 1
+        return self._next
+
+    def send_photo(self, png, caption=""):
+        self.calls.append(("send_photo", len(png)))
+        return self._id()
+
+    def send_text(self, text, reply_to=None):
+        self.calls.append(("send_text", text, reply_to))
+        return self._id()
+
+    def edit_text(self, message_id, text):
+        if self.edit_errors:
+            err = self.edit_errors.pop(0)
+            self.calls.append(("edit_text_error", message_id, err))
+            raise err
+        self.calls.append(("edit_text", message_id, text))
+
+    def pin(self, message_id):
+        self.calls.append(("pin", message_id))
+
+    def unpin(self, message_id):
+        self.calls.append(("unpin", message_id))
+
+
+def calls_of(transport, kind):
+    return [c for c in transport.calls if c[0] == kind]
+
+
+def make_run(root, name, nodes, node_states=None, run_meta=None):
+    run = Path(root) / name
+    (run / "nodes").mkdir(parents=True)
+    graph = {"name": name, "nodes": nodes}
+    byid = {n["id"]: n for n in nodes}
+    write(run / "graph.json", graph)
+    meta = {"name": name, "started": STARTED}
+    meta.update(run_meta or {})
+    write(run / "run.json", meta)
+    for nid, rec in (node_states or {}).items():
+        write(run / "nodes" / f"{nid}.json", {**stamp(byid, byid[nid]), **rec})
+    return run
+
+
+AGENT_GATE = [
+    {"id": "a", "type": "agent", "goal": "do"},
+    {"id": "g", "type": "gate", "after": ["a"], "question": "Ship it?",
+     "options": ["ship", "hold"]},  # human gate: no `wait` key (that's machine gates)
+    {"id": "b", "type": "agent", "after": ["g"], "goal": "finish"},
+]
+
+NOW = 1799999999.0
+
+
+def watcher_with(tmp, transport, **kw):
+    kw.setdefault("graphic", True)
+    kw.setdefault("watch", "all")
+    return ws.Watcher(transport, roots=[tmp], now=lambda: NOW, **kw)
+
+
+def test_adopt_sends_photo_once_then_text_reply_and_pins_text():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        make_run(tmp, "adopt", AGENT_GATE,
+                 node_states={"a": {"status": "done", "output": {"ok": True}}})
+        transport = FakeTransport()
+        stats = watcher_with(tmp, transport).poll()
+        assert stats["adopted"] == 1
+        photos, texts, pins = (calls_of(transport, "send_photo"),
+                               calls_of(transport, "send_text"), calls_of(transport, "pin"))
+        assert len(photos) == len(texts) == len(pins) == 1, transport.calls
+        photo_id, text_id = 101, 102  # fake counter: photo adopted first
+        assert texts[0][2] == photo_id          # the text replies to the photo
+        assert pins[0][1] == text_id            # the TEXT message is pinned, not the photo
+        text = texts[0][1]
+        assert "🔀 adopt — held · 1/3 · ⏱" in text
+        assert "[2] ⏸️ g — gate · held — waiting on you (→ a)" in text
+        assert "❓ Ship it?" in text and "⚙️ ship / hold" in text
+
+
+def test_edits_are_edge_triggered_only_on_state_change():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        run = make_run(tmp, "edge", AGENT_GATE,
+                       node_states={"a": {"status": "running", "pid": 0}})
+        transport = FakeTransport()
+        watcher = watcher_with(tmp, transport)
+        watcher.poll()
+        watcher.poll()  # identical state: no edit
+        assert calls_of(transport, "edit_text") == []
+        rec = json.loads((run / "nodes" / "a.json").read_text())
+        rec["status"] = "done"
+        write(run / "nodes" / "a.json", rec)
+        stats = watcher.poll()
+        assert stats["edited"] == 1 and len(calls_of(transport, "edit_text")) == 1
+        assert "[1] ✅ a" in calls_of(transport, "edit_text")[0][2]
+        watcher.poll()  # nothing changed again
+        assert len(calls_of(transport, "edit_text")) == 1
+
+
+def test_terminal_state_edits_unpins_and_closes():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        run = make_run(tmp, "term", AGENT_GATE,
+                       node_states={"a": {"status": "done"}})
+        transport = FakeTransport()
+        watcher = watcher_with(tmp, transport)
+        watcher.poll()
+        graph = json.loads((run / "graph.json").read_text())
+        byid = {n["id"]: n for n in graph["nodes"]}
+        write(run / "nodes" / "g.json", {**stamp(byid, byid["g"]), "status": "done"})
+        write(run / "nodes" / "b.json", {**stamp(byid, byid["b"]), "status": "done"})
+        stats = watcher.poll()
+        assert stats["closed"] == 1, stats
+        assert len(calls_of(transport, "unpin")) == 1
+        book = ws.load_book(run)
+        assert book["closed"] is True and book["pinned"] is False
+        assert "🏁 done" in calls_of(transport, "edit_text")[-1][2]
+        # closed runs are never touched again
+        transport.calls.clear()
+        assert watcher.poll()["seen"] == 1 and not transport.calls
+
+
+def test_restart_recovers_bookkeeping_without_duplicate_photo():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        run = make_run(tmp, "crash", AGENT_GATE,
+                       node_states={"a": {"status": "running", "pid": 0}})
+        first = FakeTransport()
+        watcher_with(tmp, first).poll()
+        assert len(calls_of(first, "send_photo")) == 1
+        # restart: a brand-new watcher recovers the on-disk book
+        second = FakeTransport()
+        watcher_with(tmp, second).poll()
+        assert calls_of(second, "send_photo") == [] and calls_of(second, "send_text") == []
+        assert calls_of(second, "pin") == []
+        rec = json.loads((run / "nodes" / "a.json").read_text())
+        rec["status"] = "done"
+        write(run / "nodes" / "a.json", rec)
+        stats = watcher_with(tmp, second).poll()
+        assert stats["edited"] == 1
+        assert ws.load_book(run)["text_message_id"] == 102  # first watcher's text id, resumed
+
+
+def test_watch_filter_gates_adoption():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        make_run(tmp, "tg", AGENT_GATE,
+                 node_states={"a": {"status": "done"}},
+                 run_meta={"owner": {"session": "s1", "platform": "telegram"}})
+        make_run(tmp, "desk", AGENT_GATE,
+                 node_states={"a": {"status": "done"}},
+                 run_meta={"owner": {"session": "s2", "platform": "desktop"}})
+        transport = FakeTransport()
+        watcher_with(tmp, transport, watch="telegram").poll()
+        adopted = calls_of(transport, "send_text")
+        assert len(adopted) == 1 and "tg" in adopted[0][1]
+        # WATCH=off adopts nothing
+        off = FakeTransport()
+        watcher_with(tmp, off, watch="off").poll()
+        assert not off.calls
+
+
+def test_throttle_backoff_defers_then_delivers():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        run = make_run(tmp, "throttle", AGENT_GATE,
+                       node_states={"a": {"status": "running", "pid": 0}})
+        transport = FakeTransport()
+        clock = [1000.0]
+        watcher = ws.Watcher(transport, roots=[tmp], now=lambda: clock[0])
+        watcher.poll()
+        transport.edit_errors = [ws.TelegramError(429, "Too Many Requests: retry after 30",
+                                                  retry_after=30)]
+        rec = json.loads((run / "nodes" / "a.json").read_text())
+        rec["status"] = "done"
+        write(run / "nodes" / "a.json", rec)
+        stats = watcher.poll()
+        assert stats["throttled"] == 1 and not calls_of(transport, "edit_text")
+        assert ws.load_book(run)["edit_ok_at"] >= 1000.0 + 30.0
+        watcher.poll()  # still inside the backoff window: the pending edge keeps waiting
+        assert not calls_of(transport, "edit_text")
+        clock[0] += 31.0
+        stats = watcher.poll()
+        assert stats["edited"] == 1 and len(calls_of(transport, "edit_text")) == 1
+
+
+def test_deleted_message_is_reposted_once():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        run = make_run(tmp, "repost", AGENT_GATE,
+                       node_states={"a": {"status": "running", "pid": 0}})
+        transport = FakeTransport()
+        watcher = watcher_with(tmp, transport)
+        watcher.poll()
+        old_text_id = ws.load_book(run)["text_message_id"]
+        transport.edit_errors = [ws.TelegramError(400, "Bad Request: message to edit not found")]
+        rec = json.loads((run / "nodes" / "a.json").read_text())
+        rec["status"] = "done"
+        write(run / "nodes" / "a.json", rec)
+        stats = watcher.poll()
+        assert stats["edited"] == 1
+        assert len(calls_of(transport, "send_photo")) == 2  # repost carries a fresh photo
+        assert len(calls_of(transport, "pin")) == 2
+        book = ws.load_book(run)
+        assert book["text_message_id"] != old_text_id
+        assert book["last_text_sha"] == ws.text_sha(
+            ws.render_text(common.run_state(run), now=NOW))
+
+
+def test_read_model_text_renders_fanout_and_gate_from_scratch_run():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        run = make_run(tmp, "model", [
+            {"id": "fan", "type": "agent",
+             "fanout": {"items": ["first", "second"], "goal": "read {item}"}},
+            {"id": "g", "type": "gate", "after": ["fan"], "question": "Publish?",
+             "options": ["yes", "no"]},
+        ], node_states={"g": {"status": "pending"}})
+        graph = json.loads((run / "graph.json").read_text())
+        byid = {n["id"]: n for n in graph["nodes"]}
+        rows = [{"status": "done", "output": {"item": i}, "ms": 1} for i in range(2)]
+        write(run / "nodes" / "fan.json",
+              {**stamp(byid, byid["fan"]), "status": "done",
+               "output": {"items": [{"item": i} for i in range(2)], "all_results": rows}})
+        for i in range(2):  # settled per-child item records
+            write(run / "nodes" / f"fan.{i}.json",
+                  {**stamp(byid, byid["fan"]), "status": "done", "output": {"item": i}})
+        state = common.run_state(run)
+        text = ws.render_text(state, now=NOW)
+        counts = state["nodes"]["fan"].get("item_counts") or {}
+        assert counts, f"item_counts missing from read model: {state['nodes']['fan']}"
+        total = counts.get("total") if isinstance(counts.get("total"), int) \
+            else sum(v for k, v in counts.items() if isinstance(v, int) and k != "total")
+        settled = sum(counts.get(k, 0) or 0
+                      for k in ("done", "partial", "failed", "cancelled"))
+        assert f"x{total}" in text and f"{settled}/{total} settled" in text
+        assert "❓ Publish?" in text and "⚙️ yes / no" in text
+        assert "🔀 model — held" in text
+        # terminal summary renders the outcome line
+        summary = ws.render_text(dict(state, status="done", done=2), now=NOW)
+        assert "🏁 done — 2/2 settled" in summary
+
+
+def test_startup_hard_fails_without_pillow():
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "PIL" or name.startswith("PIL."):
+            raise ImportError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        (Path(tmp) / "runs").mkdir()
+        with patch.dict(os.environ, {
+                "WORKFLOW_STREAM_BOT_TOKEN": "t", "WORKFLOW_STREAM_CHAT_ID": "1",
+                "WF_RUNS_ROOT": str(Path(tmp) / "runs")}), \
+             patch.object(builtins, "__import__", fake_import):
+            code = ws.main(["--once"])
+        assert code == 2
+        with patch.object(builtins, "__import__", fake_import):
+            try:
+                ws.require_graphic_deps()
+                raised = None
+            except ws.MissingGraphicDependency as exc:
+                raised = exc.instruction
+        assert raised and 'pip install "Pillow>=10.0"' in raised
+
+
+def test_startup_hard_fails_without_vendored_font():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        try:
+            ws.font_path(root=tmp)
+            raised = None
+        except ws.MissingGraphicDependency as exc:
+            raised = exc.instruction
+        assert raised and "LiberationMono-Regular.ttf" in raised
+
+
+def test_config_requires_token_chat_and_valid_enum():
+    saved = {k: os.environ.get(k) for k in
+             ("WORKFLOW_STREAM_BOT_TOKEN", "WORKFLOW_STREAM_CHAT_ID", "WORKFLOW_STREAM_WATCH")}
+    try:
+        for key in saved:
+            os.environ.pop(key, None)
+        problems = ws._config()[5]
+        assert any("BOT_TOKEN" in p for p in problems)
+        assert any("CHAT_ID" in p for p in problems)
+        assert any("dedicated" in p.lower() for p in problems)  # token doc nudge
+        os.environ["WORKFLOW_STREAM_WATCH"] = "bogus"
+        assert any("WATCH" in p for p in ws._config()[5])
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+if __name__ == "__main__":
+    tests = sorted((name, fn) for name, fn in globals().items()
+                   if name.startswith("test_") and callable(fn))
+    failures = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print("PASS", name)
+        except Exception as exc:
+            failures += 1
+            print("FAIL", name, type(exc).__name__, str(exc))
+    print(f"TOTAL {len(tests)} FAIL {failures}")
+    sys.exit(bool(failures))
