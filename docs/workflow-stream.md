@@ -23,33 +23,21 @@ touching the gateway's update stream.
 ## Setup
 
 1. Create a bot with @BotFather → copy its token.
-2. Put the token in the Hermes env file, `~/.hermes/.env` (the daemon loads
-   `WORKFLOW_STREAM_*` keys from it itself — explicit shell env still wins):
+2. Get your chat id (message the bot once, then `getUpdates` once from any
+   throwaway client, or use your existing chat id).
+3. Put both values in the Hermes env file, `~/.hermes/.env` — the daemon
+   loads `WORKFLOW_STREAM_*` keys from it itself (explicit shell env still
+   wins):
 
 ```
 WORKFLOW_STREAM_BOT_TOKEN=123456:ABC...
+WORKFLOW_STREAM_CHAT_ID=123456789
 ```
 
-   `hermes plugins install` prompts for this automatically (masked) and saves
-   the answer to the same file; skipping is fine when you don't want Telegram
-   mirroring.
-3. **Message the bot once** from the destination chat (start with `/start`) —
-   Telegram only delivers updates for chats that have talked to the bot.
-4. **Discover your chat id** — any of:
-   - `/workflow-stream setup` in any Hermes session, or
-   - `python3 scripts/workflow_stream.py --discover-chat` from the repo, or
-   - DM **@userinfobot** — for a 1:1 chat the chat id simply equals your
-     Telegram user id.
-
-   The discovery path does `getMe` plus **one** short `getUpdates` poll and
-   prints every chat it saw plus the exact `WORKFLOW_STREAM_CHAT_ID=<id>`
-   line to append. This is a setup-only exception to the send-only rule:
-   the dedicated bot has no other update consumer, so one poll cannot
-   conflict with anything, and the live daemon still never calls
-   `getUpdates`. (In a group, the id is negative — use the printed value
-   verbatim.) Then append the printed line to `~/.hermes/.env` (or re-run
-   the install prompts).
-5. Preflight, then run:
+   `hermes plugins install` prompts for these automatically (the token is
+   masked) and saves the answers to the same file; skipping is fine when you
+   don't want Telegram mirroring.
+4. Preflight, then run:
 
 ```
 python3 scripts/workflow_stream.py --check
@@ -64,15 +52,6 @@ token fails cleanly at startup instead of surfacing as a bare 404 on the
 first `sendPhoto`. From a session, the same preflight is available as the
 `workflow` tool's `action=stream_check`, whose result carries `next_steps`
 for walking through setup.
-
-## In-session control: `/workflow-stream`
-
-| Command | Effect |
-| --- | --- |
-| `/workflow-stream` or `status` | Config presence, watch mode, graphic deps, whether the daemon process is alive, and the last recorded stream error (the failure beacon). No network — answers instantly. |
-| `on` / `off` | Rewrite `WORKFLOW_STREAM_WATCH=all/off` in `~/.hermes/.env`. The daemon re-reads WATCH **every poll cycle**, so the toggle takes effect live — no restart. `off` idles the daemon; runs already adopted still close out. An explicit process-env `WORKFLOW_STREAM_WATCH` at daemon start pins the mode for that process and ignores file toggles. |
-| `setup` | Chat-id discovery when the token exists but the chat doesn't (the one-time `getUpdates` poll above); otherwise reports what's missing. |
-| `check` | The full preflight (`getMe`/`getChat` — same as `stream_check`). |
 
 On the first live start the daemon pins a one-card micro-readme into the
 destination chat — what the stream does, the tuning knobs, and a docs link.
@@ -135,21 +114,9 @@ re-derives run truth from disk via the plugin's own read model
 (`wfcommon.run_state`) and resumes the existing message — it reposts only if
 Telegram reports the message deleted.
 
-## Failure beacon (no silent degradation)
-
-A token that dies mid-run (revoked, network gone, chat blocked) cannot post
-about its own failure to Telegram — so the failure lands locally instead:
-every Telegram-path error bumps a failure counter and rewrites
-`stream-status.json` beside the runs root (`error`, `failures`, `since`,
-`last_at`); a clean poll cycle clears it. `/workflow-stream status` reports
-the beacon, so a silently-dead stream is one command away from a diagnosis.
-
 ## Discipline
 
-- Send-only Telegram API at runtime: `sendMessage`, `sendPhoto`,
-  `editMessageText`, `pinChatMessage`, `unpinChatMessage`. Never
-  `getUpdates` — the ONE exception is `--discover-chat` / `/workflow-stream
-  setup`, a human setup step that polls updates once against the dedicated
-  bot (which has no other update consumer).
+- Send-only Telegram API: `sendMessage`, `sendPhoto`, `editMessageText`,
+  `pinChatMessage`, `unpinChatMessage`. Never `getUpdates`.
 - No gate answering: release stays with the agent / `workflow` tool — the
   message informs, it doesn't accept commands.

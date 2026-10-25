@@ -4761,10 +4761,8 @@ def act_stream_check(args):
         out["problems"] = problems
         out["next_steps"] = [
             "create a DEDICATED bot with @BotFather (t.me/BotFather) and copy its token — never the gateway bot's token",
-            "append WORKFLOW_STREAM_BOT_TOKEN=<token> to ~/.hermes/.env (never echo the token into chat)",
-            "message the new bot once from the destination chat (start with /start)",
-            "discover the chat id: run /workflow-stream setup in any session, or `python3 " + str(HERE / "scripts" / "workflow_stream.py") + " --discover-chat` — it polls getUpdates ONCE (setup-only) and prints the exact WORKFLOW_STREAM_CHAT_ID line to append; DM @userinfobot as a cross-check (a 1:1 chat id equals your user id)",
-            "append WORKFLOW_STREAM_CHAT_ID=<chat id> to ~/.hermes/.env, then re-run action=stream_check",
+            "append WORKFLOW_STREAM_BOT_TOKEN=<token> and WORKFLOW_STREAM_CHAT_ID=<chat id> to ~/.hermes/.env (never echo the token into chat)",
+            "message the new bot once from the destination chat (lets getChat resolve it), then re-run action=stream_check",
             "after ok: start the daemon — python3 " + str(HERE / "scripts" / "workflow_stream.py") + " (its first live start pins a setup readme into the chat)",
         ]
     else:
@@ -4772,67 +4770,8 @@ def act_stream_check(args):
         out["next_steps"] = [
             "start the daemon — python3 " + str(HERE / "scripts" / "workflow_stream.py") +
             " (loop mode; its first live start pins a setup readme into the chat)",
-            "in-session control: /workflow-stream status | on | off (on/off rewrites WORKFLOW_STREAM_WATCH and takes effect live — no restart)",
         ]
     return out
-
-
-def _workflow_stream_command(raw_args: str, **_kwargs) -> str:
-    """`/workflow-stream` — in-session control for the Telegram mirror.
-    status (default) | on | off | setup | check. on/off rewrite
-    WORKFLOW_STREAM_WATCH in the Hermes env file; the daemon re-reads it every
-    poll cycle, so toggling needs no restart. setup runs the one-time chat-id
-    discovery when the token exists but the chat doesn't."""
-    ws = _load_stream_module()
-    ws.load_hermes_env_file()
-    args = (raw_args or "").strip().split()
-    cmd = args[0].lower() if args else "status"
-    if cmd in ("on", "off"):
-        value = "all" if cmd == "on" else "off"
-        path = ws.set_env_file_value("WORKFLOW_STREAM_WATCH", value)
-        if value == "all":
-            return (f"workflow-stream ON (WORKFLOW_STREAM_WATCH=all in {path}) — "
-                    "the daemon picks it up within one poll cycle; no restart.")
-        return (f"workflow-stream OFF (WORKFLOW_STREAM_WATCH=off in {path}) — the "
-                "daemon idles within one poll cycle; already-adopted runs still "
-                "close out. /workflow-stream on to resume; no restart.")
-    if cmd in ("setup", "discover"):
-        token = (ws.env("BOT_TOKEN") or "").strip()
-        if not token:
-            return ("no WORKFLOW_STREAM_BOT_TOKEN yet — create a DEDICATED bot with "
-                    "@BotFather (t.me/BotFather; never the gateway bot's token), append "
-                    "WORKFLOW_STREAM_BOT_TOKEN=<token> to ~/.hermes/.env (or re-run the "
-                    "plugin install prompts), then message the bot from the destination "
-                    "chat and run /workflow-stream setup again.")
-        lines, problems = ws.discover_chats(token)
-        return "\n".join(lines + problems)
-    if cmd == "check":
-        out = act_stream_check({})
-        lines = ["workflow-stream check: " + ("OK" if out.get("ok") else "PROBLEMS")]
-        lines += ["verified: " + v for v in out.get("verified", [])]
-        lines += ["problem: " + p for p in out.get("problems", [])]
-        lines += ["next: " + step for step in out.get("next_steps", [])]
-        return "\n".join(lines)
-    if cmd != "status":
-        return "Usage: /workflow-stream [status|on|off|setup|check]"
-    report = ws.stream_status_report()
-    script = report["daemon_script"]
-    lines = [
-        f"workflow-stream: watch={report['watch']} · token {'set' if report['token_set'] else 'MISSING'}"
-        f" · chat {'set' if report['chat_set'] else 'MISSING (run /workflow-stream setup)'}"
-        f" · graphic deps {'ok' if report['graphic_deps_ok'] else 'MISSING: ' + report['graphic_deps_msg']}",
-    ]
-    if report["daemon_pids"]:
-        lines.append(f"daemon: running (pid {report['daemon_pids'][0]})")
-    else:
-        lines.append(f"daemon: not running — start: python3 {script}")
-    beacon = report.get("beacon") or {}
-    if beacon:
-        lines.append(f"last stream error: {beacon.get('failures', '?')} failures since "
-                     f"{beacon.get('since', '?')} — {beacon.get('error', '?')}")
-    else:
-        lines.append("last stream error: none")
-    return "\n".join(lines)
 
 
 ACTIONS = {"run": act_run, "status": act_status, "wait": act_wait, "release": act_release,
@@ -5203,6 +5142,3 @@ def register(ctx):
             ctx, {"runs_root": runs_root, "act_release": act_release}, _common)
     ctx.register_command("wf", _wf_command, description="Workflow library: `/wf` lists, `/wf <name> [note]` replays a shelved graph",
                          args_hint="[name] [note]", argument_mode="text")
-    ctx.register_command("workflow-stream", _workflow_stream_command,
-                         description="Telegram workflow-stream mirror: /workflow-stream [status|on|off|setup|check] — status shows config/daemon/last error; on|off toggle live (no restart); setup discovers the chat id",
-                         args_hint="[status|on|off|setup|check]", argument_mode="text")

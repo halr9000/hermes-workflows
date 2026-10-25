@@ -51,7 +51,6 @@ ENV_PREFIX = "WORKFLOW_STREAM_"
 FONT_PATH_REL = Path("assets/fonts/LiberationMono-Regular.ttf")
 TERMINAL_STATUSES = ("done", "partial", "failed", "stopped")
 STREAM_BOOK_FILE = "stream.json"  # per-run bookkeeping, persisted beside the run
-STREAM_STATUS_FILE = "stream-status.json"  # runs-root failure beacon (last telegram error)
 EDIT_MIN_GAP_S = 2.0              # per-message edit throttle floor (backoff raises it)
 DEFAULT_POLL_S = 5.0
 
@@ -100,76 +99,6 @@ def load_hermes_env_file():
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         os.environ.setdefault(key.strip(), value)
-
-
-def _iter_env_file_lines(path: Path):
-    """Yield (raw_line, key, value) for WORKFLOW_STREAM_* assignments in the
-    env file — the same parse rules as load_hermes_env_file, without touching
-    os.environ (used for live re-reads and in-place edits)."""
-    try:
-        text = path.read_text()
-    except OSError:
-        return
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        key, sep, value = line.partition("=")
-        if not sep or not key.strip().startswith(ENV_PREFIX):
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        yield raw, key.strip(), value
-
-
-def read_env_file_watch(default: str = "all") -> str:
-    """Re-read WORKFLOW_STREAM_WATCH straight from the env file, bypassing the
-    os.environ setdefault cache, so a `/workflow-stream on|off` toggle takes
-    effect on the daemon's next poll cycle — no restart."""
-    path = wfcommon.hermes_home() / ".env"
-    value = None
-    for _raw, key, val in _iter_env_file_lines(path):
-        if key == ENV_PREFIX + "WATCH":
-            value = val  # last assignment wins, like dotenv semantics
-    if value is None:
-        return default
-    return value.strip().lower() or default
-
-
-def set_env_file_value(key: str, value: str) -> Path:
-    """Set KEY=value in the Hermes env file (create if absent), replacing an
-    existing assignment in place and preserving every other line. Scoped to
-    WORKFLOW_STREAM_* keys only — this helper never writes unrelated config.
-    Returns the path written."""
-    if not key.startswith(ENV_PREFIX):
-        raise ValueError(f"refusing to write non-{ENV_PREFIX} key {key!r}")
-    path = wfcommon.hermes_home() / ".env"
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        lines = []
-    prefix = "export " if any(
-        raw.lstrip().startswith("export ") and raw.split("=", 1)[0].strip().endswith(key)
-        for raw, k, _v in _iter_env_file_lines(path) if k == key) else ""
-    entry = f"{prefix}{key}={value}"
-    replaced = False
-    for index, raw in enumerate(lines):
-        stripped = raw.strip()
-        if stripped.startswith("export "):
-            stripped = stripped[len("export "):].strip()
-        candidate = stripped.partition("=")[0].strip()
-        if candidate == key:
-            lines[index] = entry
-            replaced = True
-            break
-    if not replaced:
-        lines.append(entry)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    return path
 
 
 # ---------------------------------------------------------------------------
@@ -635,9 +564,6 @@ class Watcher:
         self.watch = str(watch).lower()
         self.now = now or time.time
         self.books = {}
-        self.fail_streak = 0
-        self.fail_since = None
-        self.status_path = self.roots[0] / STREAM_STATUS_FILE if self.roots else None
 
     def _wants(self, state) -> bool:
         if self.watch == "off":
@@ -645,37 +571,6 @@ class Watcher:
         if self.watch == "telegram":
             return bool(((state.get("owner") or {}).get("platform")) == "telegram")
         return True
-
-    def _note_failure(self, exc) -> None:
-        """Record a Telegram-path failure: stderr line per occurrence plus a
-        persistent runs-root beacon (`stream-status.json`) that survives the
-        daemon and is surfaced by `stream_status_report()` / the
-        `/workflow-stream status` command — a mid-run dead token is never
-        silently swallowed."""
-        now = datetime.fromtimestamp(self.now()).astimezone().isoformat()
-        if self.fail_streak == 0:
-            self.fail_since = now
-            print("workflow-stream: telegram path degraded — beacon at "
-                  f"{self.status_path}", file=sys.stderr)
-        self.fail_streak += 1
-        record = {"error": str(exc)[:300], "failures": self.fail_streak,
-                  "since": self.fail_since, "last_at": now}
-        if self.status_path is None:
-            return
-        try:
-            self.status_path.parent.mkdir(parents=True, exist_ok=True)
-            self.status_path.write_text(json.dumps(record, indent=1))
-        except OSError:
-            pass
-
-    def _note_success(self) -> None:
-        if self.fail_streak and self.status_path is not None:
-            self.fail_streak = 0
-            self.fail_since = None
-            try:
-                self.status_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     def poll(self) -> dict:
         stats = {"seen": 0, "adopted": 0, "edited": 0, "closed": 0, "throttled": 0, "errors": 0}
@@ -693,11 +588,8 @@ class Watcher:
                 self._handle(run, state, stats)
             except Exception as exc:
                 stats["errors"] += 1
-                self._note_failure(exc)
                 print(f"workflow-stream: {run.name}: {exc}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
-        if stats["errors"] == 0:
-            self._note_success()
         return stats
 
     def _handle(self, run: Path, state: dict, stats: dict) -> None:
@@ -754,7 +646,6 @@ class Watcher:
                 self._repost(run, book, text, sha, stats)
                 return
             stats["errors"] += 1
-            self._note_failure(exc)
             print(f"workflow-stream: {run.name}: edit failed: {exc}", file=sys.stderr)
             return
         book["last_text_sha"] = sha
@@ -788,9 +679,7 @@ def _config():
                         "bot token, never the gateway bot's token (see docs/workflow-stream.md "
                         "for why: getUpdates/long-poll conflicts would break the primary bot)")
     if not chat:
-        problems.append("WORKFLOW_STREAM_CHAT_ID is required (destination chat id) — "
-                        "message the bot once from that chat, then run --discover-chat "
-                        "to print it (or DM @userinfobot: a 1:1 chat id equals your user id)")
+        problems.append("WORKFLOW_STREAM_CHAT_ID is required (destination chat id)")
     watch = (env("WATCH") or "all").strip().lower()
     if watch not in ("all", "telegram", "off"):
         problems.append(f"WORKFLOW_STREAM_WATCH must be all|telegram|off, got {watch!r}")
@@ -841,109 +730,10 @@ def run_check(token: str, chat: str, watch: str, graphic: bool, poll_s: float):
     return ok_lines, problems
 
 
-def discover_chats(token: str, api_base="https://api.telegram.org"):
-    """Setup-only chat-id discovery: getMe + ONE short getUpdates poll, then
-    print every chat seen with the exact env line to append. The LIVE daemon
-    path never calls getUpdates — send-only discipline is a runtime policy;
-    a human setup step may consume updates once against the dedicated bot
-    (it has no other update consumer, so there is no conflict to cause).
-    Returns (lines, problems)."""
-    transport = TelegramTransport(token, "", api_base=api_base)
-    try:
-        me = transport._post("getMe", {})
-    except TelegramError as exc:
-        return [], [f"BOT_TOKEN rejected by Telegram ({exc}) — is it the token of a "
-                    "DEDICATED BotFather bot, complete and unrevoked?"]
-    lines = [f"bot verified: @{me.get('username', '?')} (id {me.get('id', '?')})"]
-    try:
-        result = transport._post("getUpdates", {"timeout": 0, "limit": 100})
-    except TelegramError as exc:
-        return lines, [f"getUpdates failed ({exc}) — is another client long-polling this bot?"]
-    chats: dict = {}
-    for update in result if isinstance(result, list) else []:
-        for key in ("message", "edited_message", "channel_post",
-                    "my_chat_member", "chat_member", "callback_query"):
-            payload = update.get(key) if isinstance(update, dict) else None
-            if key == "callback_query":
-                message = (payload or {}).get("message") or {}
-                payload = {"chat": message.get("chat")}
-            chat = (payload or {}).get("chat") if isinstance(payload, dict) else None
-            if isinstance(chat, dict) and "id" in chat:
-                chats[chat["id"]] = chat  # dict keeps insertion order; last wins below
-    if not chats:
-        problems = ["no messages seen yet — send ANY message to this bot from the "
-                    "destination chat (start with /start), then run --discover-chat again"]
-        return lines, problems
-    for chat in chats.values():
-        who = (chat.get("title") or ("@" + chat["username"] if chat.get("username")
-                                     else chat.get("first_name")) or "")
-        lines.append(f"chat {chat['id']} — type {chat.get('type', '?')}"
-                     + (f" ({who})" if who else ""))
-    suggested = list(chats.values())[-1]
-    lines.append("append to the Hermes env file (~/.hermes/.env):")
-    lines.append(f"  WORKFLOW_STREAM_CHAT_ID={suggested['id']}")
-    lines.append("(1:1 chat? its id equals your Telegram user id — DM @userinfobot to cross-check)")
-    return lines, []
-
-
-def _daemon_pids():
-    """PIDs of live workflow_stream.py daemon processes (Linux /proc scan;
-    empty elsewhere). Best-effort — used only for the status report."""
-    pids = []
-    try:
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                cmdline = (entry / "cmdline").read_bytes().split(b"\x00")
-            except OSError:
-                continue
-            if any(part.endswith(b"workflow_stream.py") for part in cmdline):
-                pids.append(int(entry.name))
-    except OSError:
-        return []
-    return sorted(pids)
-
-
-def status_beacon() -> dict:
-    """Read the runs-root failure beacon (last telegram-path error), if any."""
-    path = wfcommon.runs_root() / STREAM_STATUS_FILE
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def stream_status_report() -> dict:
-    """Local truth for the /workflow-stream slash command — config presence,
-    watch mode, dependency state, daemon liveness, and the failure beacon.
-    Deliberately NO network (slash handlers must answer fast); the live
-    credential check stays with `--check` / `stream_check` / `/workflow-stream check`."""
-    load_hermes_env_file()
-    deps_ok, deps_msg = True, ""
-    try:
-        require_graphic_deps()
-    except MissingGraphicDependency as exc:
-        deps_ok, deps_msg = False, exc.instruction
-    return {
-        "token_set": bool((env("BOT_TOKEN") or "").strip()),
-        "chat_set": bool((env("CHAT_ID") or "").strip()),
-        # WATCH is file truth: the loader's os.environ setdefault would cache a
-        # pre-toggle value here and misreport the live daemon's next mode.
-        "watch": read_env_file_watch("all"),
-        "graphic_deps_ok": deps_ok,
-        "graphic_deps_msg": deps_msg,
-        "daemon_pids": _daemon_pids(),
-        "beacon": status_beacon(),
-        "daemon_script": str(Path(__file__).resolve()),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Pinned micro-readme — the stream's own one-card system alert, sent once
 # ---------------------------------------------------------------------------
-README_VERSION = 3  # bump to re-send the card after doc/config changes
+README_VERSION = 2  # bump to re-send the card after doc/config changes
 README_DOCS_URL = "https://hermes-agent.nousresearch.com/docs/plugins/hermes-workflows"
 README_TEXT = (
     "🛰 workflow-stream is live\n"
@@ -951,7 +741,6 @@ README_TEXT = (
     "+ a pinned text status, edited as the run progresses, unpinned at the end "
     "(history kept).\n"
     "Send-only bot — replies here are never read; steer runs in your Hermes chat.\n"
-    "Control it in any Hermes session: /workflow-stream status | on | off (live toggle).\n"
     "Tune: WORKFLOW_STREAM_WATCH=all|telegram|off · GRAPHIC=0|1 · POLL_S=<sec>\n"
     f"Docs: {README_DOCS_URL}"
 )
@@ -989,30 +778,8 @@ def main(argv=None) -> int:
     parser.add_argument("--check", action="store_true",
                         help="validate config, deps and Telegram credentials, then exit "
                              "(getMe/getChat only — no updates consumed)")
-    parser.add_argument("--discover-chat", action="store_true",
-                        help="setup-only chat-id discovery: message the bot from the "
-                             "destination chat first, then run this — it does ONE short "
-                             "getUpdates poll (never in live mode) and prints the exact "
-                             "WORKFLOW_STREAM_CHAT_ID line to append")
     args = parser.parse_args(argv)
     load_hermes_env_file()
-    if args.discover_chat:
-        token = (env("BOT_TOKEN") or "").strip()
-        if not token:
-            print("workflow-stream: WORKFLOW_STREAM_BOT_TOKEN is not set — create a "
-                  "DEDICATED bot with @BotFather, append its token to ~/.hermes/.env, "
-                  "then re-run --discover-chat", file=sys.stderr)
-            return 2
-        lines, problems = discover_chats(token)
-        for line in lines:
-            print(f"workflow-stream: {line}")
-        for problem in problems:
-            print(f"workflow-stream: {problem}", file=sys.stderr)
-        return 2 if problems else 0
-    # WATCH live-toggle: an explicit process-env value pins the mode for this
-    # process; otherwise the env file is re-read every poll cycle so
-    # /workflow-stream on|off takes effect without a restart.
-    shell_watch = os.environ.get(ENV_PREFIX + "WATCH")
     token, chat, watch, graphic, poll_s, problems = _config()
     ok_lines, cred_problems = run_check(token, chat, watch, graphic, poll_s)
     problems = problems + cred_problems
@@ -1033,8 +800,6 @@ def main(argv=None) -> int:
                       graphic=graphic, watch=watch)
     try:
         while True:
-            if shell_watch is None:
-                watcher.watch = read_env_file_watch(watcher.watch)
             watcher.poll()
             if args.once:
                 return 0
