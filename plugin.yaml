@@ -10,6 +10,12 @@ author: "Jacob Hausler"
 license: MIT
 homepage: https://github.com/jacobhausler/hermes-workflows
 requires_hermes: ">=0.21.4"  # v2026.9.21: measured stock -Q CLI and quiet turn-report contract
+# workflow-stream launch graphic (#3): the only non-stdlib runtime dependency.
+# Declared so it goes through Hermes' normal consent + PM admission at plugin
+# install/update time — declining it leaves the plugin disabled rather than
+# half-working, matching the daemon's hard-fail startup policy.
+python_dependencies:
+  - "Pillow>=10.0"
 provides_tools:
   - workflow
 provides_hooks:

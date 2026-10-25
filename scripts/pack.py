@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build the private, reproducible Hermes Workflows source ZIP (stdlib only)."""
+"""Build the private, reproducible Hermes Workflows source ZIP (stdlib plus the
+manifest-declared Pillow dependency)."""
 from __future__ import annotations
 
 import argparse
@@ -194,6 +195,15 @@ INCLUDE_FILES = (
     # wfcommon include. Mandatory new-file pack-surface decision, explicit per
     # the no-wholesale law.
     "outcome.py",
+    # workflow-stream (#1/#2/#3): the standalone Telegram mirror daemon ships
+    # beside the vendored mono font it renders with (byte-deterministic
+    # typography) and its setup doc. Explicit per-file listing, per the
+    # no-wholesale law. The .ttf is binary — not audited by the make_public
+    # text audit — but must be git-tracked and shipped.
+    "scripts/workflow_stream.py",
+    "assets/fonts/LiberationMono-Regular.ttf",
+    "assets/fonts/OFL-LICENSE.txt",
+    "docs/workflow-stream.md",
 )
 INCLUDE_PATTERNS = ("tests/test_*.py", "tests/test_*.mjs", "references/*.md")
 EXECUTABLE_FILES = {"scripts/pack.py", "tests/fake", "tests/fake-b1"}
