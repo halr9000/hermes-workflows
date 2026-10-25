@@ -101,6 +101,56 @@ def load_hermes_env_file():
         os.environ.setdefault(key.strip(), value)
 
 
+def _iter_env_file_lines(path):
+    try:
+        return path.read_text().splitlines()
+    except OSError:
+        return []
+
+
+def read_env_file_watch(default="all"):
+    """FILE TRUTH for WATCH — the same file the daemon loads at startup.
+    The slash command's status reports this (not a cached os.environ copy),
+    so it reflects what the daemon's next poll cycle will actually use.
+    Invalid values fall back to the default rather than raising: the toggle
+    command must never wedge on a hand-edited file."""
+    value = None
+    for raw in _iter_env_file_lines(wfcommon.hermes_home() / ".env"):
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, sep, val = line.partition("=")
+        if sep and key.strip() == ENV_PREFIX + "WATCH":
+            value = val.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+    watch = (value or default).strip().lower()
+    return watch if watch in ("all", "telegram", "off") else default
+
+
+def set_env_file_value(key, value):
+    """Append-or-rewrite `key=value` in the Hermes env file. Unrelated lines
+    are kept byte-identical, so the slash command can flip WATCH without
+    touching anything else (including other plugins' settings)."""
+    path = wfcommon.hermes_home() / ".env"
+    target = f"{key}={value}"
+    out, replaced = [], False
+    for raw in _iter_env_file_lines(path):
+        line = raw.strip()
+        probe = line[len("export "):].strip() if line.startswith("export ") else line
+        if probe.partition("=")[0].strip() == key:
+            out.append(target)
+            replaced = True
+        else:
+            out.append(raw)
+    if not replaced:
+        if out and out[-1].strip():
+            out.append("")
+        out.append(target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Launch graphic — Pillow-native raster (no SVG, no system rasterizer).
 # ---------------------------------------------------------------------------
@@ -779,6 +829,9 @@ def main(argv=None) -> int:
                         help="validate config, deps and Telegram credentials, then exit "
                              "(getMe/getChat only — no updates consumed)")
     args = parser.parse_args(argv)
+    # An explicit process-env WATCH pins the mode for this daemon's lifetime
+    # (setdefault below can't distinguish file-sourced from process-sourced).
+    watch_pinned = (ENV_PREFIX + "WATCH") in os.environ
     load_hermes_env_file()
     token, chat, watch, graphic, poll_s, problems = _config()
     ok_lines, cred_problems = run_check(token, chat, watch, graphic, poll_s)
@@ -800,6 +853,11 @@ def main(argv=None) -> int:
                       graphic=graphic, watch=watch)
     try:
         while True:
+            if not watch_pinned:
+                # /workflow-stream on|off rewrites the env file; picking it up
+                # here means toggling needs no restart. WATCH applies at
+                # adoption time only — already-adopted runs still close out.
+                watcher.watch = read_env_file_watch("all")
             watcher.poll()
             if args.once:
                 return 0

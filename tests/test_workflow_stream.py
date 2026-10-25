@@ -425,6 +425,115 @@ def test_readme_pins_once_then_skips_and_repins_on_version_bump():
         assert stub.calls.count("send_text") == 2
 
 
+def test_env_file_watch_helpers_roundtrip_and_scoping():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        with patch.object(common, "hermes_home", lambda: home):
+            assert ws.read_env_file_watch("all") == "all"  # missing file: default
+            ws.set_env_file_value("WORKFLOW_STREAM_BOT_TOKEN", "t0k")
+            ws.set_env_file_value("WORKFLOW_STREAM_WATCH", "telegram")
+            text = (home / ".env").read_text()
+            assert "WORKFLOW_STREAM_BOT_TOKEN=t0k" in text
+            assert "WORKFLOW_STREAM_WATCH=telegram" in text
+            assert ws.read_env_file_watch("all") == "telegram"
+            ws.set_env_file_value("WORKFLOW_STREAM_WATCH", "off")  # rewrite, not duplicate
+            text = (home / ".env").read_text()
+            assert text.count("WORKFLOW_STREAM_WATCH=") == 1
+            assert "WORKFLOW_STREAM_BOT_TOKEN=t0k" in text  # unrelated line untouched
+            assert ws.read_env_file_watch("all") == "off"
+            ws.set_env_file_value("WORKFLOW_STREAM_WATCH", "bogus")
+            assert ws.read_env_file_watch("all") == "all"  # invalid: fall back, never wedge
+
+
+def test_workflow_stream_command_toggles_and_reports_offline():
+    door_spec = importlib.util.spec_from_file_location("stream_cmd_door", ROOT / "__init__.py")
+    plugin = importlib.util.module_from_spec(door_spec)
+    door_spec.loader.exec_module(plugin)
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        saved = {k: os.environ.get(k) for k in
+                 ("WORKFLOW_STREAM_BOT_TOKEN", "WORKFLOW_STREAM_CHAT_ID")}
+        try:
+            for key in saved:  # a dev shell may export real values; keep the test offline
+                os.environ.pop(key, None)
+            with patch.object(common, "hermes_home", lambda: home):
+                sys.modules["workflow_stream"] = ws
+                off = plugin._workflow_stream_command("off")
+                assert "WATCH=off" in off and "no restart" in off
+                assert "WORKFLOW_STREAM_WATCH=off" in (home / ".env").read_text()
+                on = plugin._workflow_stream_command("on")
+                assert "WATCH=all" in on
+                assert "WORKFLOW_STREAM_WATCH=all" in (home / ".env").read_text()
+                unknown = plugin._workflow_stream_command("wat")
+                assert "Usage:" in unknown
+                # status is local-only: no network even with zero config
+                status = plugin._workflow_stream_command("")
+                assert "watch=all" in status and "token: NOT SET" in status
+                assert "daemon:" in status
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+class _CredsFakeTransport(FakeTransport):
+    def __init__(self, *a):  # TelegramTransport is constructed with (token, chat)
+        super().__init__()
+        _MADE.append(self)
+
+    def _post(self, method, payload):
+        self.calls.append((method, payload))
+        return {}  # getMe/getChat both OK: preflight passes, main reaches the loop
+
+
+_MADE = []
+
+
+def test_daemon_reads_watch_from_env_file_each_cycle():
+    """on/off toggle works without a restart: main() re-reads WATCH from the
+    env file every cycle — unless the operator pinned it via process env."""
+    saved = {k: os.environ.get(k) for k in
+             ("WORKFLOW_STREAM_BOT_TOKEN", "WORKFLOW_STREAM_CHAT_ID",
+              "WORKFLOW_STREAM_WATCH", "WF_RUNS_ROOT")}
+    try:
+        for key in saved:
+            os.environ.pop(key, None)
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            (home / ".env").write_text(
+                "WORKFLOW_STREAM_BOT_TOKEN=123456789:t\n"
+                "WORKFLOW_STREAM_CHAT_ID=1\n"
+                "WORKFLOW_STREAM_WATCH=off\n")
+            runs = Path(tmp) / "runs"
+            runs.mkdir()
+            with patch.object(common, "hermes_home", lambda: home), \
+                 patch.dict(os.environ, {"WF_RUNS_ROOT": str(runs)}), \
+                 patch.object(ws, "TelegramTransport", _CredsFakeTransport):
+                sys.modules["workflow_stream"] = ws
+                assert ws.main(["--once"]) == 0
+                assert not _MADE[-1].calls  # watch=off from FILE: feature idle
+            # pinned: an explicit process-env WATCH beats the file (still all → readme sent)
+            (home / ".env").write_text(
+                "WORKFLOW_STREAM_BOT_TOKEN=123456789:t\n"
+                "WORKFLOW_STREAM_CHAT_ID=1\n"
+                "WORKFLOW_STREAM_WATCH=off\n")
+            with patch.object(common, "hermes_home", lambda: home), \
+                 patch.dict(os.environ, {"WF_RUNS_ROOT": str(runs),
+                                         "WORKFLOW_STREAM_WATCH": "all"}), \
+                 patch.object(ws, "TelegramTransport", _CredsFakeTransport):
+                assert ws.main(["--once"]) == 0
+                assert any(c[0] == "pin" for c in _MADE[-1].calls)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_act_stream_check_preflight_offline():
     # House convention: load the plugin door by path, never `import __init__`.
     door_spec = importlib.util.spec_from_file_location("stream_check_door", ROOT / "__init__.py")

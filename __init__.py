@@ -4782,6 +4782,65 @@ ACTIONS = {"run": act_run, "status": act_status, "wait": act_wait, "release": ac
            "stream_check": act_stream_check}
 
 
+def _stream_daemon_running():
+    """Local liveness probe: is a workflow_stream.py daemon process alive?
+    /proc scan only — instant, no network, no Telegram traffic."""
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            cmdline = (proc / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"workflow_stream.py" in cmdline.replace(b"\x00", b" "):
+            return True
+    return False
+
+
+def _workflow_stream_command(raw_args, **_kwargs):
+    """`/workflow-stream` — in-session control of the Telegram stream,
+    Hermes-native. status = local report, instant, no network. on/off
+    rewrite WORKFLOW_STREAM_WATCH in the Hermes env file; the daemon re-reads
+    WATCH every poll cycle, so toggling needs no restart. check = the same
+    credential preflight the stream_check action runs. The stream bot is
+    send-only and this command never sends Telegram traffic."""
+    ws = _load_stream_module()
+    arg = (raw_args or "").strip().lower() or "status"
+    if arg in ("on", "off"):
+        watch = "all" if arg == "on" else "off"
+        ws.set_env_file_value("WORKFLOW_STREAM_WATCH", watch)
+        other = "off" if arg == "on" else "on"
+        return (f"workflow-stream WATCH={watch} — the daemon picks it up on its next "
+                f"poll cycle, no restart needed. Switch back: /workflow-stream {other}")
+    if arg == "check":
+        out = act_stream_check({})
+        lines = ["workflow-stream check: " + ("OK" if out.get("ok") else "PROBLEMS")]
+        lines += [f"  {v}" for v in out.get("verified", [])]
+        lines += [f"  problem: {p}" for p in out.get("problems", [])]
+        lines += out.get("next_steps", [])
+        return "\n".join(lines)
+    if arg != "status":
+        return ("Usage: /workflow-stream [status|on|off|check]\n"
+                "  status — local report (no network)\n"
+                "  on/off — live WATCH toggle (no daemon restart)\n"
+                "  check  — credential preflight (getMe/getChat)")
+    ws.load_hermes_env_file()
+    token = (ws.env("BOT_TOKEN") or "").strip()
+    chat = (ws.env("CHAT_ID") or "").strip()
+    watch = ws.read_env_file_watch("all")
+    try:
+        ws.require_graphic_deps()
+        graphic = "ok"
+    except ws.MissingGraphicDependency:
+        graphic = "missing"
+    running = _stream_daemon_running()
+    return (f"workflow-stream: watch={watch} · daemon: {'running' if running else 'NOT RUNNING'}"
+            + ("" if running else "\n  start: python3 " + str(HERE / "scripts" / "workflow_stream.py"))
+            + f"\n  token: {'set' if token else 'NOT SET'} · chat: {'set' if chat else 'NOT SET'}"
+            + f" · graphic deps: {graphic}"
+            + "\n  toggle: /workflow-stream on|off (live) · preflight: /workflow-stream check")
+
+
 def handle(args, **kwargs):
     try:
         if "hermes_bin" in args:
@@ -5142,3 +5201,6 @@ def register(ctx):
             ctx, {"runs_root": runs_root, "act_release": act_release}, _common)
     ctx.register_command("wf", _wf_command, description="Workflow library: `/wf` lists, `/wf <name> [note]` replays a shelved graph",
                          args_hint="[name] [note]", argument_mode="text")
+    ctx.register_command("workflow-stream", _workflow_stream_command,
+                         description="Telegram workflow-stream control: status (local, no network), live on/off toggle, credential check",
+                         args_hint="[status|on|off|check]", argument_mode="text")
