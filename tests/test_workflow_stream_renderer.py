@@ -40,8 +40,9 @@ def test_type_coded_shapes_have_their_named_colors():
     img = Image.open(io.BytesIO(png))
     for box in ws.layout_graph(GRAPH):
         style = ws.NODE_STYLE[box["type"]]
-        # Sample the shape center (pure fill; labels sit under the shape).
-        px = img.getpixel((box["x"] + ws.NODE_W // 2, box["y"] + ws.NODE_H // 2))
+        # Sample inside the shape above the centered label (name text starts
+        # ~15px below the top edge; the top strip is pure fill in every shape).
+        px = img.getpixel((box["x"] + ws.NODE_W // 2, box["y"] + 8))
         assert px == style["fill"], (box["id"], px, style["fill"])
 
 
@@ -59,14 +60,15 @@ def test_fixed_typography_across_differently_sized_graphs():
          for i in range(12)])}
     small_boxes = ws.layout_graph(SMALL)
     big_boxes = ws.layout_graph(big)
-    # The canvas grows; the type does not — every lane label keeps the same px.
+    # The canvas grows; the type does not — every node label keeps the same px.
     assert {b["label_px"] for b in small_boxes} == {b["label_px"] for b in big_boxes} \
-        == {ws.FONT_SIZES["lane"]}
-    assert ws.FONT_SIZES == {"lane": 12, "badge": 12}
+        == {ws.FONT_SIZES["name"]}
+    assert ws.FONT_SIZES == {"name": 13, "type": 9, "badge": 11, "title": 15,
+                             "kicker": 11}
     # Node box geometry is fixed even though the canvas is not.
     for boxes in (small_boxes, big_boxes):
         for b in boxes:
-            assert ws.NODE_W == 150 and ws.NODE_H == 56
+            assert ws.NODE_W == 150 and ws.NODE_H == 46
 
 
 def test_unknown_node_type_falls_back_to_echo_gray():

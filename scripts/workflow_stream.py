@@ -83,21 +83,26 @@ def env(name: str, default=None):
 # the canvas grows, the type does not. Values are final-scale pixels; drawing
 # happens at 2x supersample, then a single LANCZOS downscale.
 SCALE = 2
-FONT_SIZES = {"lane": 12, "badge": 12}
-NODE_W, NODE_H = 150, 56
-GAP_X, GAP_Y, LABEL_GAP = 64, 34, 20
-MARGIN = 36
-BG = (16, 20, 26)
-EDGE = (96, 104, 116)
-TEXT = (232, 236, 240)
+FONT_SIZES = {"name": 13, "type": 9, "badge": 11, "title": 15, "kicker": 11}
+NODE_W, NODE_H = 150, 46
+GAP_X, GAP_Y = 70, 26
+PAD, TITLE_H = 36, 56
+BG = (23, 26, 33)        # canvas (Telegram-dark friendly)
+EDGE = (99, 110, 133)    # connectors
+TITLE = (230, 234, 240)  # title text
+SUBTLE = (128, 138, 155) # kicker / secondary text
 # Type-coded, state-neutral: color and shape encode node TYPE only (the
 # graphic is static — everything starts pending, so status colors would
-# be meaningless there).
+# be meaningless there). Dark fill + bright border per mock v3.
 NODE_STYLE = {
-    "agent": {"fill": (0, 174, 199), "shape": "rounded"},   # cyan rounded rect
-    "gate": {"fill": (255, 176, 0), "shape": "diamond"},    # amber diamond
-    "join": {"fill": (155, 89, 205), "shape": "pill"},      # purple pill
-    "echo": {"fill": (128, 134, 139), "shape": "rect"},     # gray rectangle
+    "agent": {"border": (56, 199, 214), "label": (56, 199, 214),
+              "fill": (24, 44, 50), "shape": "rounded"},   # cyan rounded rect
+    "gate":  {"border": (240, 176, 70), "label": (240, 176, 70),
+              "fill": (52, 44, 24), "shape": "diamond"},   # amber diamond
+    "join":  {"border": (168, 122, 235), "label": (168, 122, 235),
+              "fill": (40, 32, 54), "shape": "pill"},      # purple capsule
+    "echo":  {"border": (128, 138, 155), "label": (180, 188, 200),
+              "fill": (38, 42, 50), "shape": "rounded"},   # gray rounded rect
 }
 _FALLBACK_STYLE = NODE_STYLE["echo"]
 
@@ -168,19 +173,19 @@ def layout_graph(graph):
         per_col[col] = row + 1
         boxes.append({"id": str(n["id"]), "type": str(n.get("type") or "echo"),
                       "fanout_n": fanout_n(n), "col": col, "row": row,
-                      "label_px": FONT_SIZES["lane"],
-                      "x": MARGIN + col * (NODE_W + GAP_X),
-                      "y": MARGIN + row * (NODE_H + LABEL_GAP + GAP_Y)})
+                      "label_px": FONT_SIZES["name"],
+                      "x": PAD + col * (NODE_W + GAP_X),
+                      "y": TITLE_H + PAD + row * (NODE_H + GAP_Y)})
     return boxes
 
 
 def _canvas(boxes):
     if not boxes:
-        return MARGIN * 2 + NODE_W, MARGIN * 2 + NODE_H
+        return PAD * 2 + NODE_W, TITLE_H + PAD * 2 + NODE_H
     cols = max(b["col"] for b in boxes) + 1
     rows = max(sum(1 for b in boxes if b["col"] == c) for c in range(cols))
-    return (MARGIN * 2 + cols * (NODE_W + GAP_X) - GAP_X,
-            MARGIN * 2 + rows * (NODE_H + LABEL_GAP + GAP_Y) - GAP_Y)
+    return (PAD * 2 + cols * (NODE_W + GAP_X) - GAP_X,
+            TITLE_H + PAD + rows * (NODE_H + GAP_Y) - GAP_Y + PAD)
 
 
 _font_cache = {}
@@ -197,16 +202,44 @@ def _font(px: int):
 
 
 def render_graph_png(graph, root=None) -> bytes:
-    """Render the launch graphic: 2x supersample, single LANCZOS downscale,
+    """Render the launch graphic per mock v3: dark fills with bright type-coded
+    borders, name+type labels inside the shape, curved edges with arrowheads,
+    WORKFLOW title, xN fan badges. 2x supersample, single LANCZOS downscale,
     byte-deterministic for a given graph (no wall-clock bytes anywhere)."""
     require_graphic_deps(root)
+    import math
     from PIL import Image, ImageDraw
     boxes = layout_graph(graph)
     width, height = _canvas(boxes)
     img = Image.new("RGB", (width * SCALE, height * SCALE), BG)
     draw = ImageDraw.Draw(img)
     pos = {b["id"]: (b["x"], b["y"]) for b in boxes}
-    # Edges first so shapes sit on top; drawn from the real `after` deps.
+
+    def measure(text, px):
+        b = draw.textbbox((0, 0), text, font=_font(px))
+        return b[2] - b[0], b[3] - b[1]
+
+    # ---- title: WORKFLOW kicker + graph name ----
+    name = str((graph or {}).get("name") or "workflow")
+    draw.text((PAD * SCALE, 20 * SCALE), "WORKFLOW",
+              font=_font(FONT_SIZES["kicker"]), fill=SUBTLE)
+    kw, _ = measure("WORKFLOW", FONT_SIZES["kicker"])
+    draw.text(((PAD + kw + 10) * SCALE, 18 * SCALE), name,
+              font=_font(FONT_SIZES["title"]), fill=TITLE)
+
+    # ---- edges: cubic bezier right-mid -> left-mid, filled arrowhead ----
+    def bezier(c):
+        p0, p1, p2, p3 = c[:2], c[2:4], c[4:6], c[6:8]
+        pts = []
+        for i in range(25):
+            t = i / 24
+            x = ((1 - t) ** 3 * p0[0] + 3 * (1 - t) ** 2 * t * p1[0]
+                 + 3 * (1 - t) * t ** 2 * p2[0] + t ** 3 * p3[0])
+            y = ((1 - t) ** 3 * p0[1] + 3 * (1 - t) ** 2 * t * p1[1]
+                 + 3 * (1 - t) * t ** 2 * p2[1] + t ** 3 * p3[1])
+            pts.append((x * SCALE, y * SCALE))
+        return pts
+
     for n in ((graph or {}).get("nodes") or []):
         at = pos.get(n.get("id"))
         if not at:
@@ -215,29 +248,64 @@ def render_graph_png(graph, root=None) -> bytes:
             src = pos.get(dep)
             if not src:
                 continue
-            draw.line([((src[0] + NODE_W) * SCALE, (src[1] + NODE_H // 2) * SCALE),
-                       (at[0] * SCALE, (at[1] + NODE_H // 2) * SCALE)],
-                      fill=EDGE, width=2 * SCALE)
+            p0 = (src[0] + NODE_W, src[1] + NODE_H // 2)
+            p3 = (at[0], at[1] + NODE_H // 2)
+            mid = (p0[0] + p3[0]) / 2
+            curve = bezier((p0[0], p0[1], mid, p0[1], mid, p3[1], p3[0], p3[1]))
+            draw.line(curve, fill=EDGE, width=2 * SCALE, joint="curve")
+            ax, ay = curve[-1]
+            bx, by = curve[-3]
+            ang = math.atan2(ay - by, ax - bx)
+            length, spread = 13 * SCALE, 0.45
+            draw.polygon([(ax, ay),
+                          (ax - length * math.cos(ang - spread),
+                           ay - length * math.sin(ang - spread)),
+                          (ax - length * math.cos(ang + spread),
+                           ay - length * math.sin(ang + spread))], fill=EDGE)
+
+    # ---- nodes: dark fill + bright border, labels inside ----
     for b in boxes:
         style = NODE_STYLE.get(b["type"], _FALLBACK_STYLE)
+        border, label_color, fill = style["border"], style["label"], style["fill"]
         x, y = b["x"] * SCALE, b["y"] * SCALE
         w, h = NODE_W * SCALE, NODE_H * SCALE
+        cx, cy = x + w // 2, y + h // 2
         if style["shape"] == "diamond":
-            draw.polygon([(x + w // 2, y), (x + w, y + h // 2),
-                          (x + w // 2, y + h), (x, y + h // 2)], fill=style["fill"])
+            draw.polygon([(cx, y), (x + w, cy), (cx, y + h), (x, cy)],
+                         fill=fill, outline=border, width=2 * SCALE)
         elif style["shape"] == "pill":
-            draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=style["fill"])
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2,
+                                   fill=fill, outline=border, width=2 * SCALE)
         elif style["shape"] == "rounded":
-            draw.rounded_rectangle([x, y, x + w, y + h], radius=12 * SCALE, fill=style["fill"])
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=8 * SCALE,
+                                   fill=fill, outline=border, width=2 * SCALE)
         else:
-            draw.rectangle([x, y, x + w, y + h], fill=style["fill"])
-        # Lane label under the node.
-        draw.text(((b["x"] + NODE_W / 2) * SCALE, (b["y"] + NODE_H + 5) * SCALE),
-                  b["id"], font=_font(FONT_SIZES["lane"]), fill=TEXT, anchor="ma")
+            draw.rectangle([x, y, x + w, y + h], fill=fill, outline=border,
+                           width=2 * SCALE)
+        # name label inside the shape (truncate to fit), type tag under it
+        text = b["id"]
+        while measure(text, FONT_SIZES["name"])[0] > (NODE_W - 22) * SCALE \
+                and len(text) > 3:
+            text = text[:-1]
+        tw, th = measure(text, FONT_SIZES["name"])
+        draw.text((cx - tw / 2, cy - th / 2 - 2 * SCALE), text,
+                  font=_font(FONT_SIZES["name"]), fill=label_color)
+        tag = b["type"].upper()
+        tw2, th2 = measure(tag, FONT_SIZES["type"])
+        draw.text((cx - tw2 / 2, cy + th / 2 + SCALE), tag,
+                  font=_font(FONT_SIZES["type"]),
+                  fill=tuple(int(v * 0.75) for v in label_color))
+        # fan badge: filled pill at the node's top-right
         if b["fanout_n"]:
-            badge = f"x{b['fanout_n']}" if b["fanout_n"] > 1 else "x"
-            draw.text(((b["x"] + NODE_W) * SCALE, (b["y"] - 4) * SCALE), badge,
-                      font=_font(FONT_SIZES["badge"]), fill=TEXT, anchor="ra")
+            badge = f"×{b['fanout_n']}" if b["fanout_n"] > 1 else "×"
+            bw, bh = measure(badge, FONT_SIZES["badge"])
+            bx, by = b["x"] + NODE_W - 14, b["y"] - 12
+            draw.rounded_rectangle(
+                [bx * SCALE, by * SCALE, (bx + bw + 12) * SCALE, (by + bh + 8) * SCALE],
+                radius=10 * SCALE, fill=fill, outline=border, width=SCALE)
+            draw.text(((bx + 6) * SCALE, (by + 2) * SCALE), badge,
+                      font=_font(FONT_SIZES["badge"]), fill=label_color)
+
     out = img.resize((width, height), Image.LANCZOS)
     buf = io.BytesIO()
     out.save(buf, format="PNG")
