@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""workflow-stream — a standalone Telegram mirror for Hermes workflow runs.
+
+One persistent Telegram message per run: a static, type-coded topology
+graphic sent once at launch, then a TEXT status message sent as its reply
+and pinned. The text is the live surface — edited in place on
+edge-triggered state changes, unpinned at the terminal state (the message
+stays in chat history).
+
+Send-only Telegram discipline: the daemon never calls getUpdates. That is
+also why the stream bot must be a dedicated BotFather bot: sharing the main
+gateway bot's token would make this process and the gateway's long poll
+fight over update delivery (HTTP 409 conflicts) and break the primary bot.
+
+Read model: wfcommon.run_state() over the run dir — one source of truth,
+polled from the filesystem, diffed against the last-rendered state.
+
+Crash safety: per-run stream bookkeeping (message ids, pin state, last
+rendered text hash) is persisted as stream.json beside the run and
+recovered from disk on restart.
+
+Inspired by kanban-stream; shares no imports, code, or configuration with it.
+
+Dependency policy: stdlib only at import time. When GRAPHIC=1 (the default),
+Pillow and the vendored libre mono font (assets/fonts/LiberationMono-
+Regular.ttf) are required — the daemon exits at startup with install
+instructions rather than silently degrading to a text-only stream.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import wfcommon  # noqa: E402
+
+ENV_PREFIX = "WORKFLOW_STREAM_"
+FONT_PATH_REL = Path("assets/fonts/LiberationMono-Regular.ttf")
+TERMINAL_STATUSES = ("done", "partial", "failed", "stopped")
+STREAM_BOOK_FILE = "stream.json"  # per-run bookkeeping, persisted beside the run
+EDIT_MIN_GAP_S = 2.0              # per-message edit throttle floor (backoff raises it)
+DEFAULT_POLL_S = 5.0
+
+
+class MissingGraphicDependency(RuntimeError):
+    """GRAPHIC=1 but Pillow or the vendored font is unavailable (hard fail)."""
+
+    def __init__(self, instruction):
+        super().__init__(instruction)
+        self.instruction = instruction
+
+
+class TelegramError(RuntimeError):
+    def __init__(self, status, description, retry_after=None):
+        super().__init__(f"{status}: {description}")
+        self.status = status
+        self.description = description or ""
+        self.retry_after = retry_after
+
+
+def env(name: str, default=None):
+    return os.environ.get(ENV_PREFIX + name, default)
+
+
+# ---------------------------------------------------------------------------
+# Launch graphic — Pillow-native raster (no SVG, no system rasterizer).
+# ---------------------------------------------------------------------------
+
+# Fixed typography: identical font sizes on every graph regardless of size —
+# the canvas grows, the type does not. Values are final-scale pixels; drawing
+# happens at 2x supersample, then a single LANCZOS downscale.
+SCALE = 2
+FONT_SIZES = {"lane": 12, "badge": 12}
+NODE_W, NODE_H = 150, 56
+GAP_X, GAP_Y, LABEL_GAP = 64, 34, 20
+MARGIN = 36
+BG = (16, 20, 26)
+EDGE = (96, 104, 116)
+TEXT = (232, 236, 240)
+# Type-coded, state-neutral: color and shape encode node TYPE only (the
+# graphic is static — everything starts pending, so status colors would
+# be meaningless there).
+NODE_STYLE = {
+    "agent": {"fill": (0, 174, 199), "shape": "rounded"},   # cyan rounded rect
+    "gate": {"fill": (255, 176, 0), "shape": "diamond"},    # amber diamond
+    "join": {"fill": (155, 89, 205), "shape": "pill"},      # purple pill
+    "echo": {"fill": (128, 134, 139), "shape": "rect"},     # gray rectangle
+}
+_FALLBACK_STYLE = NODE_STYLE["echo"]
+
+
+def font_path(root=None) -> Path:
+    base = Path(root) if root else ROOT
+    path = base / FONT_PATH_REL
+    if not path.is_file():
+        raise MissingGraphicDependency(
+            "workflow-stream: vendored font missing: "
+            f"{path}\n  fix: restore assets/fonts/LiberationMono-Regular.ttf and "
+            "assets/fonts/OFL-LICENSE.txt from the plugin source (no OS font "
+            "package is involved — typography must stay byte-deterministic)")
+    return path
+
+
+def require_graphic_deps(root=None) -> None:
+    """Hard dependency policy: GRAPHIC=1 with Pillow or the font missing is a
+    startup failure with install instructions — never a silent text-only stream."""
+    try:
+        import PIL  # noqa: F401  (lazy: a GRAPHIC=0 install never needs it)
+    except ImportError:
+        raise MissingGraphicDependency(
+            'workflow-stream: WORKFLOW_STREAM_GRAPHIC=1 but Pillow is not installed.\n'
+            '  fix: python -m pip install "Pillow>=10.0"\n'
+            '  (or set WORKFLOW_STREAM_GRAPHIC=0 to run without the launch graphic)')
+    font_path(root)
+
+
+def fanout_n(node) -> int:
+    """Per-child count for the xN badge: items length when known, else 1 for a
+    bare fan-out (badge renders as a bare x when the count is unknown)."""
+    f = node.get("fanout")
+    if isinstance(f, dict):
+        items = f.get("items")
+        if isinstance(items, list):
+            return len(items)
+        return 1
+    return 0
+
+
+def layout_graph(graph):
+    """Pure, deterministic column/row layout: x by longest dependency depth,
+    y by declaration order within a column. No rendering here."""
+    nodes = [n for n in ((graph or {}).get("nodes") or [])
+             if isinstance(n, dict) and n.get("id")]
+    depth = {}
+    pending = list(nodes)
+    while pending:
+        rest, progressed = [], False
+        for n in pending:
+            afters = [a for a in (n.get("after") or []) if a in depth]
+            if all(a in depth for a in afters):
+                depth[n["id"]] = 1 + max((depth[a] for a in afters), default=-1)
+                progressed = True
+            else:
+                rest.append(n)
+        if not progressed:  # cycle guard: pin leftovers after what exists
+            for n in rest:
+                depth.setdefault(n["id"], len(depth))
+            rest = []
+        pending = rest
+    per_col = {}
+    boxes = []
+    for n in nodes:
+        col = depth[n["id"]]
+        row = per_col.get(col, 0)
+        per_col[col] = row + 1
+        boxes.append({"id": str(n["id"]), "type": str(n.get("type") or "echo"),
+                      "fanout_n": fanout_n(n), "col": col, "row": row,
+                      "label_px": FONT_SIZES["lane"],
+                      "x": MARGIN + col * (NODE_W + GAP_X),
+                      "y": MARGIN + row * (NODE_H + LABEL_GAP + GAP_Y)})
+    return boxes
+
+
+def _canvas(boxes):
+    if not boxes:
+        return MARGIN * 2 + NODE_W, MARGIN * 2 + NODE_H
+    cols = max(b["col"] for b in boxes) + 1
+    rows = max(sum(1 for b in boxes if b["col"] == c) for c in range(cols))
+    return (MARGIN * 2 + cols * (NODE_W + GAP_X) - GAP_X,
+            MARGIN * 2 + rows * (NODE_H + LABEL_GAP + GAP_Y) - GAP_Y)
+
+
+_font_cache = {}
+
+
+def _font(px: int):
+    from PIL import ImageFont
+    key = px * SCALE
+    font = _font_cache.get(key)
+    if font is None:
+        font = ImageFont.truetype(str(font_path()), key)
+        _font_cache[key] = font
+    return font
+
+
+def render_graph_png(graph, root=None) -> bytes:
+    """Render the launch graphic: 2x supersample, single LANCZOS downscale,
+    byte-deterministic for a given graph (no wall-clock bytes anywhere)."""
+    require_graphic_deps(root)
+    from PIL import Image, ImageDraw
+    boxes = layout_graph(graph)
+    width, height = _canvas(boxes)
+    img = Image.new("RGB", (width * SCALE, height * SCALE), BG)
+    draw = ImageDraw.Draw(img)
+    pos = {b["id"]: (b["x"], b["y"]) for b in boxes}
+    # Edges first so shapes sit on top; drawn from the real `after` deps.
+    for n in ((graph or {}).get("nodes") or []):
+        at = pos.get(n.get("id"))
+        if not at:
+            continue
+        for dep in (n.get("after") or []):
+            src = pos.get(dep)
+            if not src:
+                continue
+            draw.line([((src[0] + NODE_W) * SCALE, (src[1] + NODE_H // 2) * SCALE),
+                       (at[0] * SCALE, (at[1] + NODE_H // 2) * SCALE)],
+                      fill=EDGE, width=2 * SCALE)
+    for b in boxes:
+        style = NODE_STYLE.get(b["type"], _FALLBACK_STYLE)
+        x, y = b["x"] * SCALE, b["y"] * SCALE
+        w, h = NODE_W * SCALE, NODE_H * SCALE
+        if style["shape"] == "diamond":
+            draw.polygon([(x + w // 2, y), (x + w, y + h // 2),
+                          (x + w // 2, y + h), (x, y + h // 2)], fill=style["fill"])
+        elif style["shape"] == "pill":
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=style["fill"])
+        elif style["shape"] == "rounded":
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=12 * SCALE, fill=style["fill"])
+        else:
+            draw.rectangle([x, y, x + w, y + h], fill=style["fill"])
+        # Lane label under the node.
+        draw.text(((b["x"] + NODE_W / 2) * SCALE, (b["y"] + NODE_H + 5) * SCALE),
+                  b["id"], font=_font(FONT_SIZES["lane"]), fill=TEXT, anchor="ma")
+        if b["fanout_n"]:
+            badge = f"x{b['fanout_n']}" if b["fanout_n"] > 1 else "x"
+            draw.text(((b["x"] + NODE_W) * SCALE, (b["y"] - 4) * SCALE), badge,
+                      font=_font(FONT_SIZES["badge"]), fill=TEXT, anchor="ra")
+    out = img.resize((width, height), Image.LANCZOS)
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Text status message (the live surface).
+# ---------------------------------------------------------------------------
+
+STATUS_EMOJI = {"pending": "hourglass", "running": "play", "done": "check", "partial": "half",
+                "failed": "cross", "skipped": "next", "held": "pause", "interrupted": "warn",
+                "stopped": "stop", "cancelled": "ban", "superseded": "return"}
+_EMOJI = {"hourglass": "⏳", "play": "▶️", "check": "✅", "half": "◑️", "cross": "❌",
+          "next": "⏭️", "pause": "⏸️", "warn": "⚠️", "stop": "⏹️", "ban": "🚫", "return": "↪️"}
+
+
+def _parse_ts(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_dur(seconds):
+    if seconds is None:
+        return "?"
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _elapsed(state, now):
+    started = _parse_ts(state.get("started"))
+    if started is None:
+        return None
+    if started.tzinfo is None:
+        started = started.astimezone()
+    return now - started.timestamp()
+
+
+def render_text(state, now=None) -> str:
+    """Header + one numbered line per node in graph declaration order, held
+    gate question/options, per-child fan-out progress, terminal summary."""
+    now = time.time() if now is None else now
+    status = str(state.get("status") or "pending")
+    name = state.get("name") or state.get("run_id") or "?"
+    done, total = state.get("done", 0), state.get("total", 0)
+    held = state.get("held_gate") or {}
+    held_id = held.get("id")
+    lines = [f"🔀 {name} — {status} · {done}/{total} · ⏱ {_fmt_dur(_elapsed(state, now))}"]
+    for i, (nid, node) in enumerate((state.get("nodes") or {}).items(), 1):
+        node_status = node.get("status")
+        emoji = _EMOJI.get(STATUS_EMOJI.get(node_status), "·")
+        bits = [str(node.get("type") or "echo")]
+        if nid == held_id:
+            emoji = _EMOJI["pause"]
+            bits.append("held — waiting on you")
+        counts = node.get("item_counts")
+        if isinstance(counts, dict) and counts:
+            n = counts.get("total")
+            if not isinstance(n, (int, float)):
+                n = sum(v for k, v in counts.items()
+                        if isinstance(v, (int, float)) and k != "total")
+            settled = sum(counts.get(k, 0) or 0
+                          for k in ("done", "partial", "failed", "cancelled"))
+            bits.append(f"x{n} · {settled}/{n} settled")
+        if node.get("seat_wait"):
+            bits.append("waiting for a seat")
+        line = f"[{i}] {emoji} {nid} — " + " · ".join(bits)
+        refs = node.get("after") or []
+        if refs:
+            line += f" (→ {', '.join(str(r) for r in refs)})"
+        lines.append(line)
+    if held_id:
+        lines.append(f"   ❓ {held.get('question') or '(no question)'}")
+        options = held.get("options")
+        if options:
+            lines.append("   ⚙️ " + " / ".join(str(o) for o in options))
+    for failed in state.get("failed_nodes") or []:
+        reason = failed.get("error_class") or failed.get("error") or "failed"
+        lines.append(f"   ❌ {failed.get('id')}: {reason}")
+    if status in TERMINAL_STATUSES:
+        extra = f" · {state.get('skipped')} skipped" if state.get("skipped") else ""
+        lines.append(f"🏁 {status} — {done}/{total} settled{extra} · ⏱ {_fmt_dur(_elapsed(state, now))}")
+    return "\n".join(lines)
+
+
+def text_sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Bookkeeping (crash-safe, persisted beside the run).
+# ---------------------------------------------------------------------------
+
+def _book_path(run: Path) -> Path:
+    return Path(run) / STREAM_BOOK_FILE
+
+
+def load_book(run: Path) -> dict:
+    try:
+        data = json.loads(_book_path(run).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_book(run: Path, book: dict) -> None:
+    path = _book_path(run)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(book, indent=1, sort_keys=True))
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Transport seam — send-only by contract; never getUpdates.
+# ---------------------------------------------------------------------------
+
+class Transport:
+    """Seam between the daemon and a chat backend (offline tests fake this)."""
+
+    def send_photo(self, png: bytes, caption: str = "") -> int:
+        raise NotImplementedError
+
+    def send_text(self, text: str, reply_to: int | None = None) -> int:
+        raise NotImplementedError
+
+    def edit_text(self, message_id: int, text: str) -> None:
+        raise NotImplementedError
+
+    def pin(self, message_id: int) -> None:
+        raise NotImplementedError
+
+    def unpin(self, message_id: int) -> None:
+        raise NotImplementedError
+
+
+class TelegramTransport(Transport):
+    """Telegram Bot API, send-only: sendMessage, sendPhoto, editMessageText,
+    pinChatMessage, unpinChatMessage. NEVER getUpdates — this process must not
+    compete with the gateway's long poll for update delivery."""
+
+    def __init__(self, token: str, chat_id, api_base="https://api.telegram.org"):
+        self.token = token
+        self.chat_id = str(chat_id)
+        self.api_base = api_base.rstrip("/")
+
+    def _urlopen(self, req) -> dict:
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            description, retry_after = body[:300], None
+            try:
+                parsed = json.loads(body)
+                description = str(parsed.get("description") or description)
+                retry_after = (parsed.get("parameters") or {}).get("retry_after")
+            except ValueError:
+                pass
+            raise TelegramError(exc.code, description, retry_after) from None
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise TelegramError(500, str((data or {}).get("description") or "bad telegram response"))
+        return data.get("result") or {}
+
+    def _post(self, method: str, payload: dict) -> dict:
+        url = f"{self.api_base}/bot{self.token}/{method}"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        return self._urlopen(req)
+
+    def send_photo(self, png: bytes, caption: str = "") -> int:
+        boundary = "wfstream" + uuid.uuid4().hex
+        chunks = []
+        fields = [("chat_id", self.chat_id)]
+        if caption:
+            fields.append(("caption", caption))
+        for key, value in fields:
+            chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; '
+                           f'name="{key}"\r\n\r\n{value}\r\n').encode("utf-8"))
+        chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; '
+                       'name="photo"; filename="launch.png"\r\n'
+                       'Content-Type: image/png\r\n\r\n').encode("utf-8"))
+        chunks.append(png)
+        chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        url = f"{self.api_base}/bot{self.token}/sendPhoto"
+        req = urllib.request.Request(url, data=b"".join(chunks), method="POST",
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        return (self._urlopen(req) or {}).get("message_id")
+
+    def send_text(self, text: str, reply_to: int | None = None) -> int:
+        payload = {"chat_id": self.chat_id, "text": text}
+        if reply_to is not None:
+            payload["reply_to_message_id"] = int(reply_to)
+        return (self._post("sendMessage", payload) or {}).get("message_id")
+
+    def edit_text(self, message_id: int, text: str) -> None:
+        self._post("editMessageText", {"chat_id": self.chat_id, "message_id": int(message_id),
+                                       "text": text})
+
+    def pin(self, message_id: int) -> None:
+        self._post("pinChatMessage", {"chat_id": self.chat_id, "message_id": int(message_id)})
+
+    def unpin(self, message_id: int) -> None:
+        self._post("unpinChatMessage", {"chat_id": self.chat_id, "message_id": int(message_id)})
+
+
+# ---------------------------------------------------------------------------
+# Watcher — poll the filesystem, diff against last-rendered state.
+# ---------------------------------------------------------------------------
+
+def _is_deleted_message_error(err: TelegramError) -> bool:
+    text = err.description.lower()
+    return ("message to edit not found" in text
+            or ("message" in text and "not found" in text and "chat not found" not in text))
+
+
+class Watcher:
+    """Polls run dirs via wfcommon.run_state and mirrors each into one message.
+
+    WATCH filter applies at adoption time only: runs already adopted keep
+    closing out even if the filter changes mid-flight (crash-recovery friendly)."""
+
+    def __init__(self, transport: Transport, roots, *, graphic=True, watch="all", now=None):
+        self.transport = transport
+        self.roots = [Path(r) for r in roots]
+        self.graphic = graphic
+        self.watch = str(watch).lower()
+        self.now = now or time.time
+        self.books = {}
+
+    def _wants(self, state) -> bool:
+        if self.watch == "off":
+            return False
+        if self.watch == "telegram":
+            return bool(((state.get("owner") or {}).get("platform")) == "telegram")
+        return True
+
+    def poll(self) -> dict:
+        stats = {"seen": 0, "adopted": 0, "edited": 0, "closed": 0, "throttled": 0, "errors": 0}
+        for run in wfcommon.iter_run_dirs(self.roots):
+            try:
+                state = wfcommon.run_state(run)
+            except Exception as exc:  # one unreadable run must not stall the loop
+                stats["errors"] += 1
+                print(f"workflow-stream: run_state failed for {run.name}: {exc}", file=sys.stderr)
+                continue
+            if not state:
+                continue
+            stats["seen"] += 1
+            try:
+                self._handle(run, state, stats)
+            except Exception as exc:
+                stats["errors"] += 1
+                print(f"workflow-stream: {run.name}: {exc}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+        return stats
+
+    def _handle(self, run: Path, state: dict, stats: dict) -> None:
+        name = state["run_id"]
+        book = self.books.get(name) or load_book(run) or {}
+        if book.get("closed"):
+            return
+        text = render_text(state, now=self.now())
+        sha = text_sha(text)
+        terminal = state.get("status") in TERMINAL_STATUSES
+        if not book.get("text_message_id"):
+            if not self._wants(state):
+                return  # do not adopt a run the WATCH filter excludes
+            book["adopted_at"] = datetime.fromtimestamp(
+                self.now()).astimezone().isoformat()
+            photo_id = None
+            if self.graphic:
+                photo_id = self.transport.send_photo(render_graph_png(state.get("graph")))
+            text_id = self.transport.send_text(text, reply_to=photo_id)
+            self.transport.pin(text_id)
+            book.update(photo_message_id=photo_id, text_message_id=text_id,
+                        pinned=True, last_text_sha=sha)
+            save_book(run, book)
+            self.books[name] = book
+            stats["adopted"] += 1
+        if terminal:
+            if sha != book.get("last_text_sha"):
+                self._edit(run, book, text, sha, stats)
+            if book.get("pinned"):
+                self.transport.unpin(book["text_message_id"])
+                book["pinned"] = False
+            book["closed"] = True
+            save_book(run, book)
+            stats["closed"] += 1
+        elif sha != book.get("last_text_sha"):
+            self._edit(run, book, text, sha, stats)
+
+    def _edit(self, run: Path, book: dict, text: str, sha: str, stats: dict) -> None:
+        now = self.now()
+        if now < float(book.get("edit_ok_at") or 0):
+            stats["throttled"] += 1  # edge stays pending: sha not updated, retried next poll
+            return
+        try:
+            self.transport.edit_text(book["text_message_id"], text)
+        except TelegramError as exc:
+            if exc.retry_after:
+                book["edit_ok_at"] = now + max(float(exc.retry_after), EDIT_MIN_GAP_S)
+                save_book(run, book)
+                stats["throttled"] += 1
+                return
+            if _is_deleted_message_error(exc):
+                # Telegram reports the message gone: repost once (fresh photo
+                # + text + pin). Any other failure is logged, not fatal.
+                self._repost(run, book, text, sha, stats)
+                return
+            stats["errors"] += 1
+            print(f"workflow-stream: {run.name}: edit failed: {exc}", file=sys.stderr)
+            return
+        book["last_text_sha"] = sha
+        book["edit_ok_at"] = now + EDIT_MIN_GAP_S
+        save_book(run, book)
+        stats["edited"] += 1
+
+    def _repost(self, run: Path, book: dict, text: str, sha: str, stats: dict) -> None:
+        photo_id = None
+        if self.graphic:
+            photo_id = self.transport.send_photo(render_graph_png(
+                wfcommon.run_state(run).get("graph")))
+        text_id = self.transport.send_text(text, reply_to=photo_id)
+        self.transport.pin(text_id)
+        book.update(photo_message_id=photo_id, text_message_id=text_id,
+                    pinned=True, last_text_sha=sha)
+        save_book(run, book)
+        stats["edited"] += 1
+
+
+# ---------------------------------------------------------------------------
+# Daemon entry point.
+# ---------------------------------------------------------------------------
+
+def _config():
+    problems = []
+    token = (env("BOT_TOKEN") or "").strip()
+    chat = (env("CHAT_ID") or "").strip()
+    if not token:
+        problems.append("WORKFLOW_STREAM_BOT_TOKEN is required — a DEDICATED BotFather "
+                        "bot token, never the gateway bot's token (see docs/workflow-stream.md "
+                        "for why: getUpdates/long-poll conflicts would break the primary bot)")
+    if not chat:
+        problems.append("WORKFLOW_STREAM_CHAT_ID is required (destination chat id)")
+    watch = (env("WATCH") or "all").strip().lower()
+    if watch not in ("all", "telegram", "off"):
+        problems.append(f"WORKFLOW_STREAM_WATCH must be all|telegram|off, got {watch!r}")
+    graphic_raw = (env("GRAPHIC") or "1").strip()
+    if graphic_raw not in ("0", "1"):
+        problems.append(f"WORKFLOW_STREAM_GRAPHIC must be 0 or 1, got {graphic_raw!r}")
+    try:
+        poll_s = float((env("POLL_S") or DEFAULT_POLL_S))
+    except ValueError:
+        problems.append("WORKFLOW_STREAM_POLL_S must be a number of seconds")
+        poll_s = DEFAULT_POLL_S
+    poll_s = min(max(poll_s, 1.0), 600.0)
+    return token, chat, watch, graphic_raw == "1", poll_s, problems
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="workflow-stream",
+        description="Mirror Hermes workflow runs into one persistent Telegram "
+                    "message per run (static launch graphic + live text status).")
+    parser.add_argument("--once", action="store_true",
+                        help="run a single poll cycle and exit (smoke tests)")
+    args = parser.parse_args(argv)
+    token, chat, watch, graphic, poll_s, problems = _config()
+    if problems:
+        for problem in problems:
+            print(f"workflow-stream: {problem}", file=sys.stderr)
+        return 2
+    if graphic:
+        try:
+            require_graphic_deps()
+        except MissingGraphicDependency as exc:
+            print(exc.instruction, file=sys.stderr)
+            return 2
+    watcher = Watcher(TelegramTransport(token, chat), roots=[wfcommon.runs_root()],
+                      graphic=graphic, watch=watch)
+    try:
+        while True:
+            watcher.poll()
+            if args.once:
+                return 0
+            time.sleep(poll_s)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
