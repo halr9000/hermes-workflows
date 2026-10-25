@@ -83,6 +83,7 @@ One tool, action-routed — the complete surface, with the flags that matter:
 | `library` | List shelved graphs richly (nodes, gates, fan-outs, description, tags, provenance), filterable by ALL-match tags; an empty filtered result says which tag starved. `name:"<name>"` returns required inputs and an instantiate command. |
 | `validate` | Dry-run the door's validation pipeline (defaults fill, defect collection, model/route policy) with no ping and no writes — `{ok, errors:[{node,field,msg}], resolved_routes}`. |
 | `doctor_version` | Read-only version truth for THIS install: `{live_version, newest_packaged, source_commit, drift}` — plugin.yaml vs the `install.json` provenance `pack.py` stamps at build time; one read, no network. |
+| `stream_check` | Preflight for the Telegram workflow-stream: config presence, graphic deps, and live send-side credential validation (getMe/getChat — consumes no updates); returns `next_steps` when unconfigured so any agent can walk setup on the spot. No writes. |
 
 Plus a `/wf` slash command: bare `/wf` lists the library; `/wf <name> [note]`
 returns the atomic run instruction for that graph, carrying the note as its
