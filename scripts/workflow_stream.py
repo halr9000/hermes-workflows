@@ -733,8 +733,8 @@ def run_check(token: str, chat: str, watch: str, graphic: bool, poll_s: float):
 # ---------------------------------------------------------------------------
 # Pinned micro-readme — the stream's own one-card system alert, sent once
 # ---------------------------------------------------------------------------
-README_VERSION = 1  # bump to re-send the card after doc/config changes
-README_DOCS_URL = "https://github.com/jacobhausler/hermes-workflows/blob/main/docs/workflow-stream.md"
+README_VERSION = 2  # bump to re-send the card after doc/config changes
+README_DOCS_URL = "https://hermes-agent.nousresearch.com/docs/plugins/hermes-workflows"
 README_TEXT = (
     "🛰 workflow-stream is live\n"
     "Every workflow run posts ONE message pair here: a static topology graphic "
