@@ -331,6 +331,124 @@ def test_config_requires_token_chat_and_valid_enum():
                 os.environ[key] = value
 
 
+class StubTransport:
+    """Offline stand-in for the Bot API in run_check / readme tests."""
+
+    def __init__(self, results=None, error=None):
+        self.results = results or {}
+        self.error = error
+        self.calls = []
+        self._next = 300
+
+    def _post(self, method, payload):
+        self.calls.append(method)
+        if self.error:
+            raise self.error
+        return self.results.get(method, {})
+
+    def send_text(self, text, reply_to=None):
+        self.calls.append("send_text")
+        self._next += 1
+        return self._next
+
+    def pin(self, message_id):
+        self.calls.append("pin")
+
+
+def test_hermes_env_file_fills_missing_stream_vars_only():
+    saved = {k: os.environ.get(k) for k in
+             ("WORKFLOW_STREAM_CHAT_ID", "WORKFLOW_STREAM_POLL_S", "WORKFLOW_STREAM_WATCH")}
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        (home / ".env").write_text(
+            "# comment\n"
+            "export WORKFLOW_STREAM_CHAT_ID=\"999\"\n"
+            "WORKFLOW_STREAM_POLL_S=2.5\n"
+            "WORKFLOW_STREAM_WATCH=all\n"
+            "UNRELATED=keep\n")
+        for key in ("WORKFLOW_STREAM_CHAT_ID", "WORKFLOW_STREAM_POLL_S"):
+            os.environ.pop(key, None)
+        os.environ["WORKFLOW_STREAM_WATCH"] = "telegram"  # preexisting wins
+        try:
+            with patch.object(common, "hermes_home", lambda: home):
+                ws.load_hermes_env_file()
+            assert os.environ["WORKFLOW_STREAM_CHAT_ID"] == "999"       # quotes stripped
+            assert os.environ["WORKFLOW_STREAM_POLL_S"] == "2.5"
+            assert os.environ["WORKFLOW_STREAM_WATCH"] == "telegram"    # environ wins
+            assert "UNRELATED" not in os.environ                        # prefix-scoped
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def test_run_check_off_watch_needs_no_credentials():
+    stub = StubTransport()
+    ok, problems = ws.run_check("tok", "123", "off", False, 5.0)
+    assert not problems and not stub.calls
+
+
+def test_run_check_reports_dead_token_cleanly():
+    stub_cls = lambda *a, **k: StubTransport(error=ws.TelegramError(404, "Not Found"))
+    with patch.object(ws, "TelegramTransport", stub_cls):
+        ok, problems = ws.run_check("dead", "123", "all", False, 5.0)
+    assert any("BOT_TOKEN rejected" in p and "404" in p for p in problems)
+
+
+def test_run_check_happy_path_verifies_bot_and_chat():
+    results = {"getMe": {"username": "stream_bot", "id": 7},
+               "getChat": {"type": "private", "username": "hal"}}
+    stub_cls = lambda *a, **k: StubTransport(results=results)
+    with patch.object(ws, "TelegramTransport", stub_cls):
+        ok, problems = ws.run_check("tok", "123", "all", False, 5.0)
+    assert not problems
+    assert any("@stream_bot" in line for line in ok)
+    assert any("chat verified" in line for line in ok)
+
+
+def test_readme_pins_once_then_skips_and_repins_on_version_bump():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "stream-readme.json"
+        stub = StubTransport()
+        ws.send_readme_once(stub, marker)
+        ws.send_readme_once(stub, marker)  # marker present -> no-op
+        assert stub.calls.count("send_text") == 1
+        assert stub.calls.count("pin") == 1
+        assert json.loads(marker.read_text())["version"] == ws.README_VERSION
+        ws.README_VERSION += 1
+        try:
+            ws.send_readme_once(stub, marker)  # version bump -> re-send
+        finally:
+            ws.README_VERSION -= 1
+        assert stub.calls.count("send_text") == 2
+
+
+def test_act_stream_check_preflight_offline():
+    # House convention: load the plugin door by path, never `import __init__`.
+    door_spec = importlib.util.spec_from_file_location("stream_check_door", ROOT / "__init__.py")
+    plugin = importlib.util.module_from_spec(door_spec)
+    door_spec.loader.exec_module(plugin)
+    stub_cls = lambda *a, **k: StubTransport(error=ws.TelegramError(404, "Not Found"))
+    saved = {k: os.environ.get(k) for k in ("WORKFLOW_STREAM_BOT_TOKEN", "WORKFLOW_STREAM_CHAT_ID")}
+    try:
+        os.environ["WORKFLOW_STREAM_BOT_TOKEN"] = "123456789:deadbeef"
+        os.environ["WORKFLOW_STREAM_CHAT_ID"] = "123"
+        with patch.object(ws, "TelegramTransport", stub_cls):
+            sys.modules["workflow_stream"] = ws  # plugin reuses the patched module
+            out = json.loads(plugin.handle({"action": "stream_check"}))
+        assert out["ok"] is False
+        assert any("BOT_TOKEN rejected" in p for p in out["problems"])
+        assert any("BotFather" in step for step in out["next_steps"])
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 if __name__ == "__main__":
     tests = sorted((name, fn) for name, fn in globals().items()
                    if name.startswith("test_") and callable(fn))

@@ -75,6 +75,32 @@ def env(name: str, default=None):
     return os.environ.get(ENV_PREFIX + name, default)
 
 
+def load_hermes_env_file():
+    """Load WORKFLOW_STREAM_* keys from the Hermes default env file
+    (`<hermes_home>/.env`). Setup is then a single file edit — no shell
+    sourcing dance. Keys already present in the environment win (explicit
+    `WORKFLOW_STREAM_...=... python ...` still overrides). Deliberately
+    prefix-scoped: this loader never touches unrelated configuration."""
+    path = wfcommon.hermes_home() / ".env"
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, sep, value = line.partition("=")
+        if not sep or not key.strip().startswith(ENV_PREFIX):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+
+
 # ---------------------------------------------------------------------------
 # Launch graphic — Pillow-native raster (no SVG, no system rasterizer).
 # ---------------------------------------------------------------------------
@@ -669,6 +695,79 @@ def _config():
     return token, chat, watch, graphic_raw == "1", poll_s, problems
 
 
+def run_check(token: str, chat: str, watch: str, graphic: bool, poll_s: float):
+    """Pre-flight validation, shared by --check and normal startup. Verifies
+    the Bot API credentials with getMe/getChat — both are send-side calls
+    that consume NO updates, so send-only discipline holds. Catches a dead
+    or mistyped token at startup (clean exit 2) instead of a bare 404 from
+    the first sendPhoto mid-run. Returns (ok_lines, problems)."""
+    ok_lines, problems = [], []
+    if graphic:
+        try:
+            require_graphic_deps()
+        except MissingGraphicDependency as exc:
+            problems.append(exc.instruction)
+    if watch == "off":
+        return ok_lines, problems  # feature off: the daemon just idles, no credentials needed
+    if not token:
+        return ok_lines, problems  # presence problems already listed by _config()
+    transport = TelegramTransport(token, chat)
+    try:
+        me = transport._post("getMe", {})
+        ok_lines.append(f"bot verified: @{me.get('username', '?')} (id {me.get('id', '?')})")
+    except TelegramError as exc:
+        problems.append(f"BOT_TOKEN rejected by Telegram ({exc}) — is it the token of a "
+                        "DEDICATED BotFather bot, complete and unrevoked? (a stale token "
+                        "surfaces as HTTP 404 Not Found here)")
+        return ok_lines, problems
+    if chat:
+        try:
+            info = transport._post("getChat", {"chat_id": chat})
+            ok_lines.append(f"chat verified: {info.get('title') or info.get('username') or chat} "
+                            f"(type {info.get('type', '?')})")
+        except TelegramError as exc:
+            problems.append(f"CHAT_ID rejected by Telegram ({exc}) — message the bot once, then retry")
+    return ok_lines, problems
+
+
+# ---------------------------------------------------------------------------
+# Pinned micro-readme — the stream's own one-card system alert, sent once
+# ---------------------------------------------------------------------------
+README_VERSION = 1  # bump to re-send the card after doc/config changes
+README_DOCS_URL = "https://github.com/jacobhausler/hermes-workflows/blob/main/docs/workflow-stream.md"
+README_TEXT = (
+    "🛰 workflow-stream is live\n"
+    "Every workflow run posts ONE message pair here: a static topology graphic "
+    "+ a pinned text status, edited as the run progresses, unpinned at the end "
+    "(history kept).\n"
+    "Send-only bot — replies here are never read; steer runs in your Hermes chat.\n"
+    "Tune: WORKFLOW_STREAM_WATCH=all|telegram|off · GRAPHIC=0|1 · POLL_S=<sec>\n"
+    f"Docs: {README_DOCS_URL}"
+)
+STREAM_README_MARKER = "stream-readme.json"  # beside the runs root, version-keyed
+
+
+def send_readme_once(transport, marker: Path) -> None:
+    """Pin a one-card micro-readme into the stream chat on the first live
+    start (what the stream does, how to tune it, docs pointer). Marker file
+    beside the runs root is version-keyed: bumping README_VERSION re-sends
+    after a doc/config change. Best-effort — a failed pin never blocks the
+    daemon from mirroring runs."""
+    try:
+        done = json.loads(marker.read_text()) if marker.exists() else {}
+    except (OSError, ValueError):
+        done = {}
+    if done.get("version", 0) >= README_VERSION:
+        return
+    try:
+        msg_id = transport.send_text(README_TEXT)
+        transport.pin(msg_id)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"version": README_VERSION, "message_id": msg_id}))
+    except (TelegramError, OSError) as exc:
+        print(f"workflow-stream: readme pin failed (continuing): {exc}", file=sys.stderr)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="workflow-stream",
@@ -676,19 +775,28 @@ def main(argv=None) -> int:
                     "message per run (static launch graphic + live text status).")
     parser.add_argument("--once", action="store_true",
                         help="run a single poll cycle and exit (smoke tests)")
+    parser.add_argument("--check", action="store_true",
+                        help="validate config, deps and Telegram credentials, then exit "
+                             "(getMe/getChat only — no updates consumed)")
     args = parser.parse_args(argv)
+    load_hermes_env_file()
     token, chat, watch, graphic, poll_s, problems = _config()
+    ok_lines, cred_problems = run_check(token, chat, watch, graphic, poll_s)
+    problems = problems + cred_problems
     if problems:
         for problem in problems:
             print(f"workflow-stream: {problem}", file=sys.stderr)
         return 2
-    if graphic:
-        try:
-            require_graphic_deps()
-        except MissingGraphicDependency as exc:
-            print(exc.instruction, file=sys.stderr)
-            return 2
-    watcher = Watcher(TelegramTransport(token, chat), roots=[wfcommon.runs_root()],
+    if args.check:
+        print(f"workflow-stream: watch={watch} graphic={int(graphic)} poll_s={poll_s:g}")
+        for line in ok_lines:
+            print(f"workflow-stream: {line}")
+        print("workflow-stream: OK")
+        return 0
+    watcher_transport = TelegramTransport(token, chat)
+    if watch != "off":
+        send_readme_once(watcher_transport, wfcommon.runs_root() / STREAM_README_MARKER)
+    watcher = Watcher(watcher_transport, roots=[wfcommon.runs_root()],
                       graphic=graphic, watch=watch)
     try:
         while True:

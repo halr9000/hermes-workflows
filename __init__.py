@@ -763,8 +763,8 @@ WORKFLOW_PARAMS = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["run", "status", "wait", "release", "release_lock", "steer", "inbox", "amend", "diff", "stop", "kill", "list", "save", "submit", "library", "doctor_version", "validate"],
-            "description": "run=launch a graph; wait=OPTIONAL blocking observation (not the default loop: lifecycle transitions wake the owner session on their own — end your turn after run); read state, RESPAWNING an idle runner if work is pending (blocks to the next boundary when one is live; when the lock is PROVEN wedged — Errno 11 with the kernel ledger showing zero holders and the admission lease dead — wait heals it first, the #44 escape hatch); status=read-model of a run; release=answer a held human gate; release_lock=operator hatch for a wedged runner.lock (#44): renames the stranded inode aside under the admission heal-barrier and hands the lane a fresh lock path — REFUSES unless zero live holders are proven (never heals on EACCES or a live holder); steer=queue steering text for a node; inbox=(child-side, cooperative) pull late steering lines baked for THIS spawn — call once at a natural seam; amend=replace the graph (invalidates changed nodes + all downstream by fingerprint), or pass patch to edit a few node fields without resubmitting the whole graph; diff=confirm surface: runs the amend door with dry_run FORCED (accepts patch or graph), returns the preview + graph_diff and touches nothing; stop=request stop; kill=node-targeted lane kill (node required): that lane's in-flight children are SIGKILLed, the node finishes failed error_class=killed, siblings and the run keep going; list=all runs; save=shelve a graph in the library under a name (from run_id or inline graph); library=list shelved graphs richly (name, description, tags, provenance, path-relative id). validate=dry-run the door's validation pipeline (defaults fill + defect collection + model/route policy) with no ping and no writes; returns {ok, errors:[{node,field,msg}], resolved_routes}. run from=<name> replays a shelved graph. submit=quarantine a hand-rolled graph for study (requires why_not_library >=80 chars; never joins the library — the quartermaster's human-gated loop decides); inbox kind=submissions lists them newest-first. doctor_version=read-only version truth for THIS install: {live_version, newest_packaged, source_commit, drift} comparing plugin.yaml against the install.json provenance that pack.py stamps at build time \u2014 one read, no network.",
+            "enum": ["run", "status", "wait", "release", "release_lock", "steer", "inbox", "amend", "diff", "stop", "kill", "list", "save", "submit", "library", "doctor_version", "validate", "stream_check"],
+            "description": "run=launch a graph; wait=OPTIONAL blocking observation (not the default loop: lifecycle transitions wake the owner session on their own — end your turn after run); read state, RESPAWNING an idle runner if work is pending (blocks to the next boundary when one is live; when the lock is PROVEN wedged — Errno 11 with the kernel ledger showing zero holders and the admission lease dead — wait heals it first, the #44 escape hatch); status=read-model of a run; release=answer a held human gate; release_lock=operator hatch for a wedged runner.lock (#44): renames the stranded inode aside under the admission heal-barrier and hands the lane a fresh lock path — REFUSES unless zero live holders are proven (never heals on EACCES or a live holder); steer=queue steering text for a node; inbox=(child-side, cooperative) pull late steering lines baked for THIS spawn — call once at a natural seam; amend=replace the graph (invalidates changed nodes + all downstream by fingerprint), or pass patch to edit a few node fields without resubmitting the whole graph; diff=confirm surface: runs the amend door with dry_run FORCED (accepts patch or graph), returns the preview + graph_diff and touches nothing; stop=request stop; kill=node-targeted lane kill (node required): that lane's in-flight children are SIGKILLed, the node finishes failed error_class=killed, siblings and the run keep going; list=all runs; save=shelve a graph in the library under a name (from run_id or inline graph); library=list shelved graphs richly (name, description, tags, provenance, path-relative id). validate=dry-run the door's validation pipeline (defaults fill + defect collection + model/route policy) with no ping and no writes; returns {ok, errors:[{node,field,msg}], resolved_routes}. run from=<name> replays a shelved graph. submit=quarantine a hand-rolled graph for study (requires why_not_library >=80 chars; never joins the library — the quartermaster's human-gated loop decides); inbox kind=submissions lists them newest-first. doctor_version=read-only version truth for THIS install: {live_version, newest_packaged, source_commit, drift} comparing plugin.yaml against the install.json provenance that pack.py stamps at build time \\u2014 one read, no network. stream_check=preflight-validate the Telegram workflow-stream (config presence, graphic deps, getMe/getChat credentials — send-side only, no updates consumed); run it once during setup before starting the stream daemon, and after reconfiguring; the result carries next_steps when unconfigured.",
         },
         "run_id": {"type": "string", "description": "Run id (required for every action except run/list)."},
         "name": {"type": "string", "description": "run: overrides graph.name (default workflow); save: library name overrides graph.name (lowercase, [-_.]); library: return one entry with refs-derived required params and an instantiate command. amend: set graph.name in the replacement graph; omitting it retains the run name."},
@@ -4731,11 +4731,56 @@ def act_doctor_version(args):
             "drift": bool(packaged is not None and live is not None and packaged != live)}
 
 
+def _load_stream_module():
+    """Bind scripts/workflow_stream.py by path (same discipline as wfcommon:
+    never another module's cached import). Cached under its own name so a
+    test patching that module is seen by act_stream_check."""
+    ws = sys.modules.get("workflow_stream")
+    if ws is not None:
+        return ws
+    spec = importlib.util.spec_from_file_location(
+        "workflow_stream", HERE / "scripts" / "workflow_stream.py")
+    ws = importlib.util.module_from_spec(spec)
+    sys.modules["workflow_stream"] = ws
+    spec.loader.exec_module(ws)
+    return ws
+
+
+def act_stream_check(args):
+    """Agent-runnable preflight for the Telegram workflow-stream: config
+    presence, graphic deps, and live credential validation (getMe/getChat —
+    send-side calls that consume no updates). Returns next_steps when
+    unconfigured so ANY agent can walk the user through setup on the spot."""
+    ws = _load_stream_module()
+    ws.load_hermes_env_file()
+    token, chat, watch, graphic, poll_s, problems = ws._config()
+    ok_lines, cred_problems = ws.run_check(token, chat, watch, graphic, poll_s)
+    problems = problems + cred_problems
+    out = {"ok": not problems, "watch": watch, "graphic": graphic, "poll_s": poll_s}
+    if problems:
+        out["problems"] = problems
+        out["next_steps"] = [
+            "create a DEDICATED bot with @BotFather (t.me/BotFather) and copy its token — never the gateway bot's token",
+            "append WORKFLOW_STREAM_BOT_TOKEN=<token> and WORKFLOW_STREAM_CHAT_ID=<chat id> to ~/.hermes/.env (never echo the token into chat)",
+            "message the new bot once from the destination chat (lets getChat resolve it), then re-run action=stream_check",
+            "after ok: start the daemon — python3 " + str(HERE / "scripts" / "workflow_stream.py") + " (its first live start pins a setup readme into the chat)",
+        ]
+    else:
+        out["verified"] = ok_lines
+        out["next_steps"] = [
+            "start the daemon — python3 " + str(HERE / "scripts" / "workflow_stream.py") +
+            " (loop mode; its first live start pins a setup readme into the chat)",
+        ]
+    return out
+
+
 ACTIONS = {"run": act_run, "status": act_status, "wait": act_wait, "release": act_release,
            "release_lock": act_release_lock,
            "steer": act_steer, "inbox": act_inbox, "amend": act_amend, "diff": act_diff, "stop": act_stop, "kill": act_kill, "list": act_list,
            "save": act_save, "submit": act_submit, "library": act_library,
-           "doctor_version": act_doctor_version, "validate": act_validate}
+           "doctor_version": act_doctor_version, "validate": act_validate,
+           "stream_check": act_stream_check}
+
 
 def handle(args, **kwargs):
     try:

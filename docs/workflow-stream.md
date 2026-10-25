@@ -25,13 +25,38 @@ touching the gateway's update stream.
 1. Create a bot with @BotFather → copy its token.
 2. Get your chat id (message the bot once, then `getUpdates` once from any
    throwaway client, or use your existing chat id).
-3. Export the config and start the daemon:
+3. Put both values in the Hermes env file, `~/.hermes/.env` — the daemon
+   loads `WORKFLOW_STREAM_*` keys from it itself (explicit shell env still
+   wins):
 
 ```
 WORKFLOW_STREAM_BOT_TOKEN=123456:ABC...
 WORKFLOW_STREAM_CHAT_ID=123456789
+```
+
+   `hermes plugins install` prompts for these automatically (the token is
+   masked) and saves the answers to the same file; skipping is fine when you
+   don't want Telegram mirroring.
+4. Preflight, then run:
+
+```
+python3 scripts/workflow_stream.py --check
 python3 scripts/workflow_stream.py
 ```
+
+`--check` validates config presence, the graphic dependencies, and the
+credentials against the Bot API (`getMe`/`getChat` — send-side calls that
+consume no updates), exiting non-zero with an explanation if either is
+rejected. Normal startup runs the same validation, so a dead or mistyped
+token fails cleanly at startup instead of surfacing as a bare 404 on the
+first `sendPhoto`. From a session, the same preflight is available as the
+`workflow` tool's `action=stream_check`, whose result carries `next_steps`
+for walking through setup.
+
+On the first live start the daemon pins a one-card micro-readme into the
+destination chat — what the stream does, the tuning knobs, and a docs link.
+It is version-keyed (`README_VERSION`): bump it to re-send the card after a
+doc/config change; otherwise it is sent exactly once per install.
 
 ## Configuration (env, `WORKFLOW_STREAM_` prefix)
 

@@ -16,6 +16,25 @@ requires_hermes: ">=0.21.4"  # v2026.9.21: measured stock -Q CLI and quiet turn-
 # half-working, matching the daemon's hard-fail startup policy.
 python_dependencies:
   - "Pillow>=10.0"
+# Workflow-stream setup: `hermes plugins install` prompts for unset values
+# (masked when secret) and saves them to ~/.hermes/.env — the same file the
+# stream daemon loads WORKFLOW_STREAM_* keys from. Both are optional: skip
+# them if you don't mirror runs into Telegram (WORKFLOW_STREAM_WATCH).
+# The token MUST come from a dedicated @BotFather bot, never the gateway bot.
+requires_env:
+  - name: WORKFLOW_STREAM_BOT_TOKEN
+    description: >-
+      Telegram bot token for the workflow stream — a DEDICATED bot made with
+      @BotFather, never your gateway bot's token (a second getUpdates consumer
+      causes 409 conflicts). Only needed to mirror runs into Telegram; skip to
+      set it later.
+    url: https://t.me/BotFather
+    secret: true
+  - name: WORKFLOW_STREAM_CHAT_ID
+    description: >-
+      Destination Telegram chat id for stream messages (your user id or a
+      group id). Only needed to mirror runs into Telegram; skip to set later.
+    secret: false
 provides_tools:
   - workflow
 provides_hooks:
